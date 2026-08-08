@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -169,9 +170,23 @@ def test_bind_all_interfaces_with_token_allowed(caplog):
     assert "reachable from the network" in caplog.text
 
 
-def test_unusual_bind_warns(caplog):
-    HTTPConfig(bind="192.168.1.5")
-    assert "Unusual http.bind" in caplog.text
+def test_lan_bind_without_token_is_refused():
+    # Regression: a LAN address is just as reachable as 0.0.0.0. The old code
+    # only logged "Unusual http.bind" and started the RCE-capable API anyway.
+    with pytest.raises(ConfigError, match="Refusing to bind non-loopback"):
+        HTTPConfig(bind="192.168.1.5")
+
+
+def test_ipv6_wildcard_bind_without_token_is_refused():
+    with pytest.raises(ConfigError, match="Refusing to bind non-loopback"):
+        HTTPConfig(bind="::")
+
+
+def test_lan_bind_with_token_warns_and_is_public(caplog):
+    caplog.set_level(logging.WARNING, logger="looper.config")
+    cfg = HTTPConfig(bind="192.168.1.5", auth_token="t0ken")
+    assert cfg.is_public is True
+    assert "reachable from the network" in caplog.text
 
 
 def test_loopback_is_not_public():

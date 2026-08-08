@@ -134,6 +134,69 @@ def test_build_failure_sets_build_ok_false(config):
     assert phases.state.state["errors"]
 
 
+# --- Build syntax gate (S-3) -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reply_text",
+    [
+        "I'm sorry, I cannot help with that request.",
+        "def broken(:\n    return 1",
+        "   ",
+    ],
+)
+def test_build_ok_requires_parseable_code(config, reply_text):
+    """S-3: build_ok used to mean 'the LLM answered', so prose or a syntax
+    error scored the full build weight and unlocked the release band."""
+    phases = build_phases(config, replies={**DEFAULT_REPLIES, "Code Builder": reply_text})
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is False
+    assert result.ok is True  # the agent call itself succeeded
+    assert phases.state.state["errors"]
+
+
+FENCED = "```python\ndef f():\n    return 1\n```"
+
+
+def test_build_accepts_fenced_code(config):
+    phases = build_phases(config, replies={**DEFAULT_REPLIES, "Code Builder": FENCED})
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is True
+    assert result.summary == "Code generated"
+
+
+def test_fix_with_unparseable_output_does_not_set_build_ok(config):
+    phases = build_phases(config, replies={**DEFAULT_REPLIES, "Expert Fixer": "still broken(:"})
+    result = asyncio.run(phases.run_fix("goal", ["HIGH: something"]))
+    assert result.build_ok is False
+
+
+# --- Stale evidence (S-4) ----------------------------------------------------
+
+
+def test_invalidate_unverified_drops_unrepeated_evidence():
+    """S-4: a retry cycle that does not re-run review/security used to keep
+    banking cycle-1's score and empty findings list as if freshly verified."""
+    evidence = CycleEvidence(
+        build_ok=True,
+        tests_passed=5,
+        tests_total=5,
+        review_score=98.0,
+        security_issues=[],
+    )
+    evidence.invalidate_unverified(("test",))
+    assert evidence.review_score == 0.0
+    assert evidence.security_issues == ["MEDIUM: security audit not re-run this cycle"]
+    assert evidence.tests_total == 5  # test IS re-run, so it survives
+
+
+def test_invalidate_unverified_clears_tests_when_not_rerun():
+    evidence = CycleEvidence(tests_passed=3, tests_total=3, review_score=90.0)
+    evidence.invalidate_unverified(("review",))
+    assert (evidence.tests_passed, evidence.tests_total) == (0, 0)
+    assert evidence.review_score == 90.0
+
+
 # --- Review ------------------------------------------------------------------
 
 

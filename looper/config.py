@@ -134,24 +134,21 @@ class HTTPConfig:
         if not isinstance(self.bind, str) or not self.bind:
             raise ConfigError(f"http.bind must be a non-empty string, got {self.bind!r}")
 
-        if self.bind == ALL_INTERFACES:
+        # ANY non-loopback bind is network-reachable, not just 0.0.0.0. The
+        # earlier check special-cased 0.0.0.0 only, so binding a LAN address
+        # (or "::", the IPv6 wildcard) exposed the RCE-capable /build endpoint
+        # with no token at all.
+        if self.bind not in LOOPBACK_BINDS:
             if not self.auth_token:
                 raise ConfigError(
-                    f"Refusing to bind {ALL_INTERFACES} without an auth token. Set "
-                    f"${self.auth_token_env}, or bind 127.0.0.1. The /build endpoint "
-                    "triggers arbitrary LLM-driven code execution."
+                    f"Refusing to bind non-loopback address {self.bind!r} without an "
+                    f"auth token. Set ${self.auth_token_env}, or bind 127.0.0.1. The "
+                    "/build endpoint triggers arbitrary LLM-driven code execution."
                 )
             logger.warning(
                 "Binding %s: the API is reachable from the network. "
                 "Front it with a reverse proxy and TLS.",
-                ALL_INTERFACES,
-            )
-        elif self.bind not in LOOPBACK_BINDS:
-            logger.warning(
-                "Unusual http.bind=%r; expected one of %s or %s",
                 self.bind,
-                sorted(LOOPBACK_BINDS),
-                ALL_INTERFACES,
             )
 
     @property

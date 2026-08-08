@@ -8,6 +8,7 @@ reader (or a future us) does not undo a decision without knowing its reasons.
 | [001](001-package-layout-and-immutable-config.md) | Package layout, immutable config, no import-time side effects | Accepted |
 | [002](002-fail-closed-scoring.md) | Fail-closed scoring with hard release gates | Accepted |
 | [003](003-timeouts-retry-classification-cost.md) | Timeouts, retry classification, and cost accounting | Accepted |
+| [004](004-verified-evidence.md) | Verified evidence: syntax gate, loopback rule, cycle invalidation | Accepted |
 
 ## Format
 

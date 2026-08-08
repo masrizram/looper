@@ -128,6 +128,9 @@ class LooperDaemon:
             phase_names = (
                 self.config.first_cycle_phases if cycle == 1 else self.config.retry_cycle_phases
             )
+            if cycle > 1:
+                # Only evidence this cycle re-verifies may count toward its score.
+                evidence.invalidate_unverified(phase_names)
             evidence = await self._run_phases(goal, phase_names, evidence)
 
             final = self.scoring.calculate(

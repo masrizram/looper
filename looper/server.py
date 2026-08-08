@@ -139,7 +139,19 @@ class HTTPServer:
         self._tasks.add(task)
         # Without this the set grows forever - a slow memory leak in a daemon.
         task.add_done_callback(self._tasks.discard)
+        # A background build that raises used to vanish into asyncio's
+        # "Task exception was never retrieved" noise: the operator got a 200
+        # and no signal at all that the run had died.
+        task.add_done_callback(self._log_task_failure)
         return task
+
+    @staticmethod
+    def _log_task_failure(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Background build failed: %s", exc, exc_info=exc)
 
     def _json(self, payload: dict[str, Any], status: int = 200) -> Any:
         return self._web.json_response(payload, status=status)

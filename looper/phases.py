@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import re
@@ -31,6 +32,16 @@ TESTS_FILE = "tests/test_generated.py"
 REVIEW_FILE = "review.md"
 SECURITY_FILE = "security_audit.md"
 DOCS_FILE = "docs/README.md"
+
+#: Agents habitually wrap code in ```python fences. Parsing the fenced text as
+#: Python would always raise, so the fences are stripped before the check.
+_FENCE_RE = re.compile(r"^\s*```[^\n]*\n(.*?)\n?```\s*$", re.DOTALL)
+
+
+def strip_code_fences(text: str) -> str:
+    """Return the body of a single fenced block, or ``text`` unchanged."""
+    match = _FENCE_RE.match(text or "")
+    return match.group(1) if match else (text or "")
 
 
 class WorkspaceEscapeError(ValueError):
@@ -100,6 +111,22 @@ class CycleEvidence:
             self.review_score = result.review_score
         elif result.phase == "security_audit":
             self.security_issues = list(result.security_issues)
+
+    def invalidate_unverified(self, phases: Sequence[str]) -> None:
+        """Drop evidence no phase in this cycle will re-establish.
+
+        Carrying a previous cycle's review score or empty findings list into a
+        cycle that does not re-run those phases scores unverified facts as
+        verified. A trimmed ``retry_phases`` could therefore keep banking a 98
+        review from cycle 1 forever.
+        """
+        if "review" not in phases:
+            self.review_score = 0.0
+        if "security_audit" not in phases:
+            self.security_issues = ["MEDIUM: security audit not re-run this cycle"]
+        if "test" not in phases:
+            self.tests_passed = 0
+            self.tests_total = 0
 
 
 class PhaseManager:
@@ -252,11 +279,35 @@ class PhaseManager:
             prompt=self.prompts.build(goal, architecture),
             output_file=CODE_FILE,
         )
+        build_ok, note = self._verify_syntax(reply)
+        summary = "Code generated" if build_ok else (note or result.summary)
+        if reply.ok and not build_ok:
+            self.state.record_error(f"build: {note}")
+            self.state.save()
         return replace_result(
             result,
-            build_ok=reply.ok,
-            summary="Code generated" if reply.ok else result.summary,
+            build_ok=build_ok,
+            summary=summary,
         )
+
+    def _verify_syntax(self, reply: AgentReply) -> tuple[bool, str]:
+        """``build_ok`` must mean *the code parses*, not *the LLM answered*.
+
+        Previously any non-empty reply -- prose, an apology, a truncated file --
+        scored the full build weight. Now the generated module is parsed; a
+        syntax error fails the build closed.
+        """
+        if reply.failed:
+            return False, ""
+        source = strip_code_fences(reply.text)
+        if not source.strip():
+            return False, "build produced empty output"
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:
+            logger.error("Generated code does not parse: %s", exc)
+            return False, f"generated code has a syntax error: {exc}"
+        return True, ""
 
     async def run_test(self, goal: str) -> PhaseResult:
         code = self.read_file(CODE_FILE)
@@ -423,15 +474,18 @@ class PhaseManager:
         )
 
         files = list(result.files_created)
+        build_ok, note = self._verify_syntax(reply)
         if reply.ok:
             files.append(self.write_file(CODE_FILE, reply.text))
+            if not build_ok:
+                self.state.record_error(f"fix: {note}")
             self.state.save()
 
         return replace_result(
             result,
-            build_ok=reply.ok,
+            build_ok=build_ok,
             files_created=tuple(files),
-            summary="Fixes applied" if reply.ok else result.summary,
+            summary=("Fixes applied" if build_ok else (note or result.summary)),
         )
 
 

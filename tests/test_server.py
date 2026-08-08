@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -192,6 +193,43 @@ def test_completed_tasks_are_discarded():
         return len(server._tasks)
 
     assert asyncio.run(run()) == 0
+
+
+def test_background_build_failure_is_logged(caplog):
+    """S-5: a crashing background build used to return 200 and then vanish
+    into asyncio's 'Task exception was never retrieved' noise, so an operator
+    had no signal at all that the run had died."""
+    caplog.set_level(logging.ERROR, logger="looper.server")
+
+    async def boom(goal):
+        raise RuntimeError("build exploded")
+
+    server = make_server(callback=boom)
+
+    async def run():
+        await server.handle_build(FakeRequest({"goal": "x"}))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert "Background build failed" in caplog.text
+    assert "build exploded" in caplog.text
+
+
+def test_cancelled_background_build_is_not_logged_as_failure(caplog):
+    caplog.set_level(logging.ERROR, logger="looper.server")
+
+    async def slow(goal):
+        await asyncio.sleep(10)
+
+    server = make_server(callback=slow)
+
+    async def run():
+        await server.handle_build(FakeRequest({"goal": "x"}))
+        await server.stop()
+
+    asyncio.run(run())
+    assert "Background build failed" not in caplog.text
 
 
 def test_stop_cancels_in_flight_tasks():
