@@ -107,3 +107,33 @@ jobs:
 
       - name: config.yaml must pass validation
         run: python -m looper.cli --check-config
+
+  models:
+    name: Verify model slugs against OpenRouter
+    runs-on: ubuntu-latest
+    # Model rot is time-based, not commit-based: a slug that works today can be
+    # retired next month without anyone touching this repo. The weekly cron in
+    # `on.schedule` is what actually catches that; running it per-push just
+    # stops a bad slug from landing in the first place.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Every configured model slug must be served by OpenRouter
+        # Exits 2 on an unknown slug. A wrong slug is well-formed YAML, so
+        # --check-config cannot catch it; without this it surfaces mid-build,
+        # after earlier phases have already been billed.
+        #
+        # No API key is used: the catalogue endpoint is public. If it is
+        # unreachable the command warns and exits 0, so a network blip cannot
+        # turn into a red build on an unrelated PR.
+        run: python -m looper.cli --check-models

@@ -104,17 +104,44 @@ class AgentSpec:
         _require_int(self.max_tokens, f"agent[{self.role}].max_tokens", 1, 1_000_000)
 
 
+#: Default agent roster. Model slugs were verified against the live OpenRouter
+#: catalogue (``GET /api/v1/models``); ``looper --check-models`` re-verifies
+#: them, because a slug that 404s only fails at build time otherwise.
+#:
+#: Tiering follows cost/capability rather than brand:
+#:   reasoning-heavy, low token volume  -> Opus 5      (~$5/$25 per M)
+#:   adversarial review, needs a *different* family than the builder
+#:                                      -> GPT-5.6 Sol (~$5/$30 per M)
+#:   code generation, high token volume -> Sonnet 5    (~$2/$10 per M)
+#:   long-context prose, cheap          -> Gemini 3.1 Pro / Terra
 DEFAULT_AGENTS: Mapping[str, AgentSpec] = {
-    "researcher": AgentSpec("deepseek/deepseek-r1", "Senior Technical Researcher", 0.3),
-    "architect": AgentSpec("deepseek/deepseek-r1", "System Architect", 0.3),
-    "ux_api_designer": AgentSpec("openai/gpt-4o", "UX/API Designer", 0.4),
-    "builder": AgentSpec("anthropic/claude-3.5-sonnet", "Code Builder", 0.2),
-    "tester": AgentSpec("deepseek/deepseek-r1", "Test Generator", 0.3),
-    "reviewer": AgentSpec("anthropic/claude-3.5-sonnet", "Senior Reviewer", 0.2),
-    "security_auditor": AgentSpec("openai/gpt-4o", "Security Auditor", 0.2),
-    "performance_optimizer": AgentSpec("anthropic/claude-3.5-sonnet", "Performance Optimizer", 0.2),
-    "documentation_writer": AgentSpec("google/gemini-pro-1.5", "Documentation Writer", 0.4),
-    "fixer": AgentSpec("anthropic/claude-3.5-sonnet", "Expert Fixer", 0.2),
+    "researcher": AgentSpec("anthropic/claude-opus-5", "Senior Technical Researcher", 0.3),
+    "architect": AgentSpec("anthropic/claude-opus-5", "System Architect", 0.3),
+    "ux_api_designer": AgentSpec("openai/gpt-5.6-sol", "UX/API Designer", 0.4),
+    "builder": AgentSpec("anthropic/claude-sonnet-5", "Code Builder", 0.2),
+    # Test design is where overfitting is caught, so it gets a frontier model
+    # from a different family than the builder (ADR-006).
+    "tester": AgentSpec("anthropic/claude-opus-5", "Test Generator", 0.3),
+    "reviewer": AgentSpec("openai/gpt-5.6-terra", "Senior Reviewer", 0.2),
+    "security_auditor": AgentSpec("openai/gpt-5.6-sol", "Security Auditor", 0.2),
+    "performance_optimizer": AgentSpec("anthropic/claude-sonnet-5", "Performance Optimizer", 0.2),
+    "documentation_writer": AgentSpec("google/gemini-3.1-pro-preview", "Documentation Writer", 0.4),
+    "fixer": AgentSpec("anthropic/claude-sonnet-5", "Expert Fixer", 0.2),
+}
+
+#: Blended USD per 1K tokens for the default roster, from the live OpenRouter
+#: catalogue. Without these the cost budget prices an Opus call at the generic
+#: $0.002/1K guess and under-reports spend by roughly 7x, which would make
+#: ``max_cost_usd`` (ADR-005) a budget in name only.
+DEFAULT_MODEL_PRICES_USD_PER_1K: Mapping[str, float] = {
+    "anthropic/claude-opus-5": 0.015,
+    "openai/gpt-5.6-sol": 0.0175,
+    "anthropic/claude-sonnet-5": 0.006,
+    "openai/gpt-5.6-terra": 0.0035,
+    "google/gemini-3.1-pro-preview": 0.007,
+    "deepseek/deepseek-v4-pro": 0.00065,
+    "deepseek/deepseek-v4-flash": 0.00021,
+    "x-ai/grok-4.5": 0.004,
 }
 
 #: Phase name -> agent key. Used to validate that configured phases are runnable.
@@ -239,8 +266,12 @@ class ExecutionConfig:
     #: silently running up the bill. 0 disables the cap. ADR-005.
     max_cost_usd: float = 0.0
     #: Per-model USD price per 1K tokens, used to estimate spend from usage.
-    #: Missing models fall back to ``default_token_price_usd``. 0 == unknown.
-    model_prices_usd_per_1k: Mapping[str, float] = field(default_factory=dict)
+    #: Defaults to the verified prices for the default roster; anything the
+    #: user supplies is merged over the top. Missing models fall back to
+    #: ``default_token_price_usd``. 0 == unknown.
+    model_prices_usd_per_1k: Mapping[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_MODEL_PRICES_USD_PER_1K)
+    )
     default_token_price_usd: float = 0.002
     #: Optional path (relative to --config dir or absolute) to a user-owned
     #: pytest suite. If set, the generated code must ALSO pass the user's
@@ -467,7 +498,10 @@ def build_config(
         max_history_entries=exec_raw.get("max_history_entries", 500),
         max_file_bytes=exec_raw.get("max_file_bytes", 2_000_000),
         max_cost_usd=exec_raw.get("max_cost_usd", 0.0),
-        model_prices_usd_per_1k=exec_raw.get("model_prices_usd_per_1k", {}),
+        model_prices_usd_per_1k={
+            **DEFAULT_MODEL_PRICES_USD_PER_1K,
+            **exec_raw.get("model_prices_usd_per_1k", {}),
+        },
         default_token_price_usd=exec_raw.get("default_token_price_usd", 0.002),
         user_tests_dir=exec_raw.get("user_tests_dir", ""),
         min_test_assertions_per_100_lines=exec_raw.get("min_test_assertions_per_100_lines", 6),

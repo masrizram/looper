@@ -270,6 +270,7 @@ python -m looper.cli --check-config
 | `--goal "..."` | Run one build, exit non-zero if below `min_acceptable` |
 | `--daemon` | Run HTTP server + file watcher until signalled |
 | `--check-config` | Validate config and exit |
+| `--check-models` | Verify every configured model slug against the live OpenRouter catalogue, and exit |
 | `--doctor` | Report the sandbox/git capability this host actually has, and exit |
 | `--reset` | Clear persisted state |
 | `--config PATH` | Use a specific config file |

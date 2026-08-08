@@ -13,6 +13,7 @@ from typing import Any, Sequence
 
 from looper import __version__
 from looper.config import ConfigError, CostBudgetExceeded, LooperConfig, load_config_with_dir
+from looper.models import CatalogueUnavailableError, check_models, fetch_catalogue
 from looper.orchestrator import LooperDaemon
 from looper.sandbox import (
     SandboxUnavailableError,
@@ -72,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset", action="store_true", help="Reset persisted state and exit")
     parser.add_argument("--check-config", action="store_true", help="Validate config and exit")
     parser.add_argument(
+        "--check-models",
+        action="store_true",
+        help="Verify every configured model slug against the live OpenRouter catalogue, and exit",
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Report which sandbox/git capabilities this host actually provides, and exit",
@@ -117,6 +123,38 @@ async def _run_daemon(daemon: LooperDaemon) -> int:
         await serve
     except asyncio.CancelledError:
         pass
+    return EXIT_OK
+
+
+def run_check_models(config: LooperConfig) -> int:
+    """Fail fast on a model slug OpenRouter does not serve.
+
+    A bad slug is well-formed YAML, so ``--check-config`` cannot catch it; it
+    surfaces mid-build instead, after earlier phases have already been billed.
+    """
+    try:
+        catalogue = fetch_catalogue(config.openrouter.base_url)
+    except CatalogueUnavailableError as exc:
+        # An unreachable catalogue is not the same as a bad model. Say so, and
+        # do not fail the check on a flaky network.
+        logger.warning("Could not verify models: %s", exc)
+        return EXIT_OK
+
+    results = check_models({key: spec.model for key, spec in config.agents.items()}, catalogue)
+    unknown = [r for r in results if not r.known]
+    for result in results:
+        logger.info(
+            "%-22s %-34s %s", result.agent, result.model, "ok" if result.known else "NOT FOUND"
+        )
+
+    if unknown:
+        logger.error(
+            "%d model slug(s) are not served by OpenRouter: %s",
+            len(unknown),
+            ", ".join(f"{r.agent}={r.model}" for r in unknown),
+        )
+        return EXIT_CONFIG_ERROR
+    logger.info("All %d model slugs verified against %s", len(results), config.openrouter.base_url)
     return EXIT_OK
 
 
@@ -183,6 +221,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             len(config.agents),
         )
         return EXIT_OK
+
+    if args.check_models:
+        return run_check_models(config)
 
     if args.doctor:
         return run_doctor(config)

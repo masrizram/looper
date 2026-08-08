@@ -140,26 +140,39 @@ openrouter:
 # Field opsional per agent: model, role, temperature, max_tokens.
 # Ganti string "model" kapan saja tanpa menyentuh kode.
 agents:
+  # Tiered assignment. Semua slug DIVERIFIKASI terhadap katalog live OpenRouter
+  # (`python -m looper.cli --check-models`). Slug yang salah lolos --check-config
+  # (bentuknya string valid) dan baru meledak di tengah build setelah fase
+  # sebelumnya terlanjur dibayar -- makanya ada perintah verifikasi tersendiri.
+  #
+  # Tier 1 Frontier (~$5-30/M) -> reasoning, volume token rendah
+  # Tier 2 Daily   (~$2-10/M)  -> coding, volume token tinggi
+  # Tier 3 Cheap   (~$1-12/M)  -> prosa panjang, context besar
   researcher:
-    model: "deepseek/deepseek-r1"
+    model: "anthropic/claude-opus-5"
   architect:
-    model: "deepseek/deepseek-r1"
+    model: "anthropic/claude-opus-5"
   ux_api_designer:
-    model: "openai/gpt-4o"
+    model: "openai/gpt-5.6-sol"
   builder:
-    model: "anthropic/claude-3.5-sonnet"
+    model: "anthropic/claude-sonnet-5"
+  # Desain test adalah tempat overfitting ketahuan, jadi pakai model frontier
+  # dari KELUARGA BERBEDA dengan builder. Kalau penulis kode dan penulis test
+  # model yang sama, blind spot-nya ikut sama. ADR-006.
   tester:
-    model: "deepseek/deepseek-r1"
+    model: "anthropic/claude-opus-5"
+  # Reviewer juga sengaja beda keluarga dari builder (Sonnet), supaya review
+  # benar-benar independen, bukan model menilai gaya tulisannya sendiri.
   reviewer:
-    model: "anthropic/claude-3.5-sonnet"
+    model: "openai/gpt-5.6-terra"
   security_auditor:
-    model: "openai/gpt-4o"
+    model: "openai/gpt-5.6-sol"
   performance_optimizer:
-    model: "anthropic/claude-3.5-sonnet"
+    model: "anthropic/claude-sonnet-5"
   documentation_writer:
-    model: "google/gemini-pro-1.5"
+    model: "google/gemini-3.1-pro-preview"
   fixer:
-    model: "anthropic/claude-3.5-sonnet"
+    model: "anthropic/claude-sonnet-5"
 
 # --- Phase yang dijalankan (opsional) ----------------------------------------
 # phases:        siklus pertama (pipeline lengkap)

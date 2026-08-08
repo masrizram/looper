@@ -3,6 +3,35 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+* **Default agent roster re-tiered to current models.** Every slug was verified
+  against the live OpenRouter catalogue; four of the previously shipped slugs
+  (`anthropic/claude-3.5-sonnet`, `google/gemini-pro-1.5`) no longer exist and
+  would have failed mid-build. Reasoning phases (research, architecture, test
+  design) now use Opus 5, coding uses Sonnet 5, security uses GPT-5.6 Sol,
+  documentation uses Gemini 3.1 Pro.
+* **Reviewer moved off the builder's model family** (`openai/gpt-5.6-terra`).
+  A reviewer from the same family as the author shares its blind spots, which
+  weakens the independence ADR-006 depends on.
+* **Real prices shipped for the default roster.** Cost estimation previously
+  fell back to a flat $0.002/1K guess, under-reporting Opus spend ~7x and
+  making `max_cost_usd` (ADR-005) a budget in name only. User-supplied prices
+  are merged over the defaults rather than replacing them.
+
+### Added
+
+* **`looper --check-models`** — verifies every configured slug against
+  `GET /api/v1/models` and exits `2` on an unknown one. A bad slug is
+  well-formed YAML, so `--check-config` cannot catch it; it used to surface
+  mid-pipeline after earlier phases had already been billed. An unreachable
+  catalogue warns and passes, so an offline machine is not reported as broken.
+* **CI job `models`** runs `--check-models` on every push/PR and on the weekly
+  cron, so a slug retired by the provider turns the build red on its own
+  instead of being discovered by a paid, half-finished build.
+
 ## [2.1.0] - 2026-08-08
 
 ### Added
