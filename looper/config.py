@@ -1,0 +1,455 @@
+"""Immutable, validated configuration objects.
+
+Design decisions (ADR-001):
+
+* Config is a frozen dataclass tree, not a dict of module-level globals.
+  The previous design called ``configure()`` at import time, which made
+  ``import daemon`` fail outright when no ``config.yaml`` sat in the CWD and
+  made two differently-configured instances impossible.
+* Every value is validated once, at construction, so the rest of the codebase
+  can treat the config as trusted and skip defensive ``.get(..., default)``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Mapping
+
+import yaml
+
+logger = logging.getLogger("looper.config")
+
+DEFAULT_CONFIG_FILENAMES = ("config.yaml", "looper_config.yaml")
+
+DEFAULT_FIRST_CYCLE_PHASES = (
+    "research",
+    "architecture",
+    "build",
+    "test",
+    "review",
+    "security_audit",
+)
+DEFAULT_RETRY_CYCLE_PHASES = ("test", "review", "security_audit")
+DEFAULT_FINAL_PHASES = ("performance_optimize", "documentation")
+
+KNOWN_PHASES = frozenset(
+    {
+        "research",
+        "architecture",
+        "build",
+        "test",
+        "review",
+        "security_audit",
+        "performance_optimize",
+        "documentation",
+    }
+)
+
+LOOPBACK_BINDS = frozenset({"127.0.0.1", "localhost", "::1"})
+ALL_INTERFACES = "0.0.0.0"  # nosec B104 - compared against, never bound by default
+
+
+class ConfigError(ValueError):
+    """Raised when the supplied configuration is invalid."""
+
+
+def _require_int(value: Any, name: str, low: int, high: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{name} must be an int, got {value!r}")
+    if not low <= value <= high:
+        raise ConfigError(f"{name} must be between {low} and {high}, got {value}")
+    return value
+
+
+def _require_number(value: Any, name: str, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{name} must be a number, got {value!r}")
+    if not low <= float(value) <= high:
+        raise ConfigError(f"{name} must be between {low} and {high}, got {value}")
+    return float(value)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentSpec:
+    """One LLM role: which model answers, and with what sampling settings."""
+
+    model: str
+    role: str
+    temperature: float = 0.3
+    max_tokens: int = 8192
+
+    def __post_init__(self) -> None:
+        if not self.model or not isinstance(self.model, str):
+            raise ConfigError(f"agent model must be a non-empty string, got {self.model!r}")
+        if not self.role or not isinstance(self.role, str):
+            raise ConfigError(f"agent role must be a non-empty string, got {self.role!r}")
+        _require_number(self.temperature, f"agent[{self.role}].temperature", 0.0, 2.0)
+        _require_int(self.max_tokens, f"agent[{self.role}].max_tokens", 1, 1_000_000)
+
+
+DEFAULT_AGENTS: Mapping[str, AgentSpec] = {
+    "researcher": AgentSpec("deepseek/deepseek-r1", "Senior Technical Researcher", 0.3),
+    "architect": AgentSpec("deepseek/deepseek-r1", "System Architect", 0.3),
+    "ux_api_designer": AgentSpec("openai/gpt-4o", "UX/API Designer", 0.4),
+    "builder": AgentSpec("anthropic/claude-3.5-sonnet", "Code Builder", 0.2),
+    "tester": AgentSpec("deepseek/deepseek-r1", "Test Generator", 0.3),
+    "reviewer": AgentSpec("anthropic/claude-3.5-sonnet", "Senior Reviewer", 0.2),
+    "security_auditor": AgentSpec("openai/gpt-4o", "Security Auditor", 0.2),
+    "performance_optimizer": AgentSpec("anthropic/claude-3.5-sonnet", "Performance Optimizer", 0.2),
+    "documentation_writer": AgentSpec("google/gemini-pro-1.5", "Documentation Writer", 0.4),
+    "fixer": AgentSpec("anthropic/claude-3.5-sonnet", "Expert Fixer", 0.2),
+}
+
+#: Phase name -> agent key. Used to validate that configured phases are runnable.
+PHASE_AGENTS: Mapping[str, str] = {
+    "research": "researcher",
+    "architecture": "architect",
+    "build": "builder",
+    "test": "tester",
+    "review": "reviewer",
+    "security_audit": "security_auditor",
+    "performance_optimize": "performance_optimizer",
+    "documentation": "documentation_writer",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class HTTPConfig:
+    bind: str = "127.0.0.1"
+    port: int = 9999
+    auth_token_env: str = "LOOPER_HTTP_TOKEN"
+    auth_token: str = ""
+    max_goal_length: int = 20_000
+    rate_limit_per_minute: int = 10
+    max_body_bytes: int = 65_536
+
+    def __post_init__(self) -> None:
+        _require_int(self.port, "http.port", 1, 65535)
+        _require_int(self.max_goal_length, "http.max_goal_length", 1, 1_000_000)
+        _require_int(self.rate_limit_per_minute, "http.rate_limit_per_minute", 1, 100_000)
+        _require_int(self.max_body_bytes, "http.max_body_bytes", 1, 100_000_000)
+        if not isinstance(self.bind, str) or not self.bind:
+            raise ConfigError(f"http.bind must be a non-empty string, got {self.bind!r}")
+
+        if self.bind == ALL_INTERFACES:
+            if not self.auth_token:
+                raise ConfigError(
+                    f"Refusing to bind {ALL_INTERFACES} without an auth token. Set "
+                    f"${self.auth_token_env}, or bind 127.0.0.1. The /build endpoint "
+                    "triggers arbitrary LLM-driven code execution."
+                )
+            logger.warning(
+                "Binding %s: the API is reachable from the network. "
+                "Front it with a reverse proxy and TLS.",
+                ALL_INTERFACES,
+            )
+        elif self.bind not in LOOPBACK_BINDS:
+            logger.warning(
+                "Unusual http.bind=%r; expected one of %s or %s",
+                self.bind,
+                sorted(LOOPBACK_BINDS),
+                ALL_INTERFACES,
+            )
+
+    @property
+    def is_public(self) -> bool:
+        return self.bind not in LOOPBACK_BINDS
+
+
+@dataclass(frozen=True, slots=True)
+class ScoringWeights:
+    """Score composition. All four buckets must sum to 100."""
+
+    build: float = 20.0
+    tests: float = 30.0
+    security: float = 30.0
+    review: float = 20.0
+
+    critical: float = 30.0
+    high: float = 15.0
+    medium: float = 5.0
+    low: float = 2.0
+    unknown: float = 5.0
+
+    unverified_build_cap: float = 60.0
+    critical_finding_cap: float = 50.0
+
+    def __post_init__(self) -> None:
+        for name in ("build", "tests", "security", "review"):
+            _require_number(getattr(self, name), f"scoring.{name}", 0.0, 100.0)
+        total = self.build + self.tests + self.security + self.review
+        if abs(total - 100.0) > 1e-6:
+            raise ConfigError(f"scoring weights must sum to 100, got {total}")
+        for name in ("critical", "high", "medium", "low", "unknown"):
+            _require_number(getattr(self, name), f"scoring.severity.{name}", 0.0, 100.0)
+        for name in ("unverified_build_cap", "critical_finding_cap"):
+            _require_number(getattr(self, name), f"scoring.{name}", 0.0, 100.0)
+
+    def penalty_for(self, severity: str) -> float:
+        return {
+            "CRITICAL": self.critical,
+            "HIGH": self.high,
+            "MEDIUM": self.medium,
+            "LOW": self.low,
+        }.get(severity.upper(), self.unknown)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    max_attempts: int = 3
+    backoff_base: float = 2.0
+    backoff_max: float = 60.0
+
+    def __post_init__(self) -> None:
+        _require_int(self.max_attempts, "retry.max_attempts", 1, 100)
+        _require_number(self.backoff_base, "retry.backoff_base", 1.0, 100.0)
+        _require_number(self.backoff_max, "retry.backoff_max", 0.0, 3600.0)
+
+    def delay_for(self, attempt: int) -> float:
+        """Seconds to wait before ``attempt`` + 1. Capped at ``backoff_max``."""
+        return min(self.backoff_max, self.backoff_base**attempt)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    max_cycles: int = 5
+    target_score: float = 99.0
+    min_acceptable: float = 95.0
+    test_timeout_seconds: int = 600
+    max_history_entries: int = 500
+
+    def __post_init__(self) -> None:
+        _require_int(self.max_cycles, "execution.max_cycles", 1, 1000)
+        _require_number(self.target_score, "execution.target_score", 0.0, 100.0)
+        _require_number(self.min_acceptable, "execution.min_acceptable", 0.0, 100.0)
+        _require_int(self.test_timeout_seconds, "execution.test_timeout_seconds", 1, 86_400)
+        _require_int(self.max_history_entries, "execution.max_history_entries", 1, 1_000_000)
+        if self.min_acceptable > self.target_score:
+            raise ConfigError(
+                "execution.min_acceptable must be <= target_score, got "
+                f"min={self.min_acceptable}, target={self.target_score}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRouterConfig:
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
+    api_key: str = ""
+    site_url: str = ""
+    site_name: str = "Looper Daemon"
+
+    def __post_init__(self) -> None:
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ConfigError(f"openrouter.base_url must be http(s), got {self.base_url!r}")
+
+    def default_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self.site_url:
+            headers["HTTP-Referer"] = self.site_url
+        if self.site_name:
+            headers["X-Title"] = self.site_name
+        return headers
+
+
+def _validate_phases(names: Any, field_name: str) -> tuple[str, ...]:
+    if isinstance(names, str) or not isinstance(names, (list, tuple)):
+        raise ConfigError(f"{field_name} must be a list of phase names, got {names!r}")
+    result = tuple(str(n) for n in names)
+    unknown = [n for n in result if n not in KNOWN_PHASES]
+    if unknown:
+        raise ConfigError(
+            f"{field_name} contains unknown phase(s) {unknown}; "
+            f"known phases are {sorted(KNOWN_PHASES)}"
+        )
+    if len(set(result)) != len(result):
+        raise ConfigError(f"{field_name} contains duplicate phases: {result}")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class LooperConfig:
+    """Fully validated runtime configuration."""
+
+    workspace: Path = Path("./workspace")
+    state_file: Path = Path("./looper_state.json")
+    watch_file: Path = Path("./looper_commands.txt")
+    watch_interval: float = 2.0
+
+    http: HTTPConfig = field(default_factory=HTTPConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    scoring: ScoringWeights = field(default_factory=ScoringWeights)
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
+    openrouter: OpenRouterConfig = field(default_factory=OpenRouterConfig)
+
+    agents: Mapping[str, AgentSpec] = field(default_factory=lambda: dict(DEFAULT_AGENTS))
+
+    first_cycle_phases: tuple[str, ...] = DEFAULT_FIRST_CYCLE_PHASES
+    retry_cycle_phases: tuple[str, ...] = DEFAULT_RETRY_CYCLE_PHASES
+    final_phases: tuple[str, ...] = DEFAULT_FINAL_PHASES
+
+    def __post_init__(self) -> None:
+        _require_number(self.watch_interval, "watch_interval", 0.01, 3600.0)
+        missing = [k for k in DEFAULT_AGENTS if k not in self.agents]
+        if missing:
+            raise ConfigError(f"missing agent definitions: {sorted(missing)}")
+
+    def with_(self, **changes: Any) -> LooperConfig:
+        """Return a copy with ``changes`` applied (config stays immutable)."""
+        return replace(self, **changes)
+
+
+def _read_env(name: str, env: Mapping[str, str] | None) -> str:
+    source = os.environ if env is None else env
+    return source.get(name, "") or ""
+
+
+def build_config(
+    raw: Mapping[str, Any] | None, env: Mapping[str, str] | None = None
+) -> LooperConfig:
+    """Turn a raw mapping (typically parsed YAML) into a validated config.
+
+    ``env`` is injectable so tests never have to mutate the real environment.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ConfigError(f"config root must be a mapping, got {type(raw).__name__}")
+
+    def section(name: str) -> Mapping[str, Any]:
+        value = raw.get(name) or {}
+        if not isinstance(value, Mapping):
+            raise ConfigError(f"config section {name!r} must be a mapping, got {value!r}")
+        return value
+
+    http_raw = section("http")
+    auth_env = str(http_raw.get("auth_token_env", "LOOPER_HTTP_TOKEN"))
+    # Legacy top-level `http_port` is still honoured so old configs keep working.
+    port = http_raw.get("port", raw.get("http_port", 9999))
+    http = HTTPConfig(
+        bind=str(http_raw.get("bind", "127.0.0.1")),
+        port=port,
+        auth_token_env=auth_env,
+        auth_token=_read_env(auth_env, env),
+        max_goal_length=http_raw.get("max_goal_length", 20_000),
+        rate_limit_per_minute=http_raw.get("rate_limit_per_minute", 10),
+        max_body_bytes=http_raw.get("max_body_bytes", 65_536),
+    )
+
+    exec_raw = section("execution")
+    execution = ExecutionConfig(
+        max_cycles=exec_raw.get("max_cycles", 5),
+        target_score=exec_raw.get("target_score", 99.0),
+        min_acceptable=exec_raw.get("min_acceptable", 95.0),
+        test_timeout_seconds=exec_raw.get("test_timeout_seconds", 600),
+        max_history_entries=exec_raw.get("max_history_entries", 500),
+    )
+
+    scoring_raw = section("scoring")
+    severity_raw = scoring_raw.get("severity") or {}
+    if not isinstance(severity_raw, Mapping):
+        raise ConfigError(f"scoring.severity must be a mapping, got {severity_raw!r}")
+    scoring = ScoringWeights(
+        build=scoring_raw.get("build", 20.0),
+        tests=scoring_raw.get("tests", 30.0),
+        security=scoring_raw.get("security", 30.0),
+        review=scoring_raw.get("review", 20.0),
+        critical=severity_raw.get("critical", 30.0),
+        high=severity_raw.get("high", 15.0),
+        medium=severity_raw.get("medium", 5.0),
+        low=severity_raw.get("low", 2.0),
+        unknown=severity_raw.get("unknown", 5.0),
+        unverified_build_cap=scoring_raw.get("unverified_build_cap", 60.0),
+        critical_finding_cap=scoring_raw.get("critical_finding_cap", 50.0),
+    )
+
+    retry_raw = section("retry")
+    retry = RetryPolicy(
+        max_attempts=retry_raw.get("max_attempts", 3),
+        backoff_base=retry_raw.get("backoff_base", 2.0),
+        backoff_max=retry_raw.get("backoff_max", 60.0),
+    )
+
+    or_raw = section("openrouter")
+    api_key_env = str(or_raw.get("api_key_env", "OPENROUTER_API_KEY"))
+    openrouter = OpenRouterConfig(
+        base_url=str(or_raw.get("base_url", "https://openrouter.ai/api/v1")),
+        api_key_env=api_key_env,
+        api_key=_read_env(api_key_env, env),
+        site_url=str(or_raw.get("site_url", "")),
+        site_name=str(or_raw.get("site_name", "Looper Daemon")),
+    )
+
+    agents_raw = section("agents")
+    agents: dict[str, AgentSpec] = {}
+    unknown_agents = set(agents_raw) - set(DEFAULT_AGENTS)
+    if unknown_agents:
+        raise ConfigError(
+            f"unknown agent key(s) {sorted(unknown_agents)}; "
+            f"valid keys are {sorted(DEFAULT_AGENTS)}"
+        )
+    for key, default in DEFAULT_AGENTS.items():
+        override = agents_raw.get(key) or {}
+        if not isinstance(override, Mapping):
+            raise ConfigError(f"agents.{key} must be a mapping, got {override!r}")
+        agents[key] = AgentSpec(
+            model=str(override.get("model", default.model)),
+            role=str(override.get("role", default.role)),
+            temperature=override.get("temperature", default.temperature),
+            max_tokens=override.get("max_tokens", default.max_tokens),
+        )
+
+    return LooperConfig(
+        workspace=Path(str(raw.get("workspace", "./workspace"))),
+        state_file=Path(str(raw.get("state_file", "./looper_state.json"))),
+        watch_file=Path(str(raw.get("watch_file", "./looper_commands.txt"))),
+        watch_interval=raw.get("watch_interval", 2.0),
+        http=http,
+        execution=execution,
+        scoring=scoring,
+        retry=retry,
+        openrouter=openrouter,
+        agents=agents,
+        first_cycle_phases=_validate_phases(
+            raw.get("phases", list(DEFAULT_FIRST_CYCLE_PHASES)), "phases"
+        ),
+        retry_cycle_phases=_validate_phases(
+            raw.get("retry_phases", list(DEFAULT_RETRY_CYCLE_PHASES)), "retry_phases"
+        ),
+        final_phases=_validate_phases(
+            raw.get("final_phases", list(DEFAULT_FINAL_PHASES)), "final_phases"
+        ),
+    )
+
+
+def load_config(
+    path: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> LooperConfig:
+    """Load and validate config from YAML.
+
+    With no ``path``, tries the known default filenames in order so a repo
+    carrying either ``config.yaml`` or ``looper_config.yaml`` works.
+    """
+    candidates: list[str | os.PathLike[str]]
+    candidates = [path] if path is not None else list(DEFAULT_CONFIG_FILENAMES)
+
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                parsed = yaml.safe_load(handle)
+        except FileNotFoundError:
+            continue
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"{candidate} is not valid YAML: {exc}") from exc
+        logger.info("Loading config from %s", candidate)
+        return build_config(parsed, env=env)
+
+    if path is not None:
+        raise FileNotFoundError(f"Config file not found: {path}")
+    raise FileNotFoundError(
+        "No config file found. Looked for: " + ", ".join(DEFAULT_CONFIG_FILENAMES)
+    )

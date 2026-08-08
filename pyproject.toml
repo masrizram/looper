@@ -1,6 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "looper"
+version = "2.0.0"
+description = "Autonomous multi-agent software build pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "openai>=1.30",
+    "aiohttp>=3.9",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "black>=24.3",
+    "isort>=5.13",
+    "flake8>=7.0",
+    "mypy>=1.10",
+    "types-PyYAML",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+]
+
+[project.scripts]
+looper = "looper.cli:main"
+
+[tool.setuptools]
+packages = ["looper"]
+py-modules = ["daemon"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -q"
+addopts = "-ra -q --strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["looper", "daemon"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
 
 [tool.black]
 line-length = 100
@@ -13,3 +64,16 @@ line_length = 100
 [tool.flake8]
 max-line-length = 100
 extend-ignore = ["E203", "W503"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+ignore_errors = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "workspace"]

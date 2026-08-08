@@ -1,12 +1,13 @@
 # =============================================================================
 # Looper Daemon configuration
 # -----------------------------------------------------------------------------
-# File ini dibaca oleh daemon.py (default: config.yaml, fallback looper_config.yaml).
-# Kalau kamu punya file config lama bernama looper_config.yaml, daemon tetap
-# bisa memuatnya berkat fallback otomatis di load_config().
+# Dibaca oleh looper/config.py (default: config.yaml, fallback looper_config.yaml).
+# Semua field OPSIONAL -- yang tidak ditulis memakai default di kode.
 #
-# Semua field bersifat opsional -- nilai yang tidak ditulis pakai default di kode.
-# Ganti "model" kapan saja tanpa perlu ubah daemon.py.
+# ATURAN KEAMANAN: file ini TIDAK PERNAH menyimpan secret. Yang disimpan hanya
+# NAMA environment variable (mis. api_key_env), nilainya diambil dari env.
+#
+# Validasi config: python -m looper.cli --check-config
 # =============================================================================
 
 # Direktori kerja relatif terhadap CWD saat menjalankan daemon.
@@ -14,35 +15,72 @@ workspace: "./workspace"
 state_file: "./looper_state.json"
 watch_file: "./looper_commands.txt"
 
+# Interval polling watch_file, dalam detik.
+watch_interval: 2.0
+
 # --- HTTP API server ---------------------------------------------------------
-# Bind default 127.0.0.1 (hanya localhost) demi keamanan. Ganti ke 0.0.0.0
-# HANYA jika sudah di belakang reverse proxy ber-auth (mis. nginx + mTLS).
-# auth_token_env: nama environment variable yang menyimpan bearer token.
-#   Kalau kosong/tidak diset, server tetap jalan TAPI tanpa auth (warning di log).
+# PERINGATAN: POST /build memicu eksekusi kode buatan LLM. Perlakukan endpoint
+# ini sebagai remote code execution. Default bind 127.0.0.1 (localhost saja).
+# Bind ke 0.0.0.0 TANPA auth token akan DITOLAK saat startup (bukan cuma warning).
 http:
   bind: "127.0.0.1"
   port: 9999
+  # Nama env var berisi bearer token. Dibandingkan constant-time (hmac).
   auth_token_env: "LOOPER_HTTP_TOKEN"
+  # Batas ukuran body request (byte) -- cegah memory exhaustion.
+  max_body_bytes: 65536
+  # Batas panjang goal (karakter) -- cegah biaya LLM tak terbatas.
+  max_goal_length: 20000
+  # Batas request /build per menit per alamat IP.
+  rate_limit_per_minute: 10
 
 execution:
   max_cycles: 5
   target_score: 99
   min_acceptable: 95
+  # Hard timeout untuk pytest atas kode buatan LLM. Tanpa ini, satu
+  # infinite-loop di generated test menggantung daemon 24/7 selamanya.
+  test_timeout_seconds: 600
+  # Batas entri history/errors di state -- cegah file state tumbuh tanpa henti.
+  max_history_entries: 500
 
-# --- Koneksi ke OpenRouter --------------------------------------------
+# --- Kebijakan retry panggilan LLM -------------------------------------------
+retry:
+  max_attempts: 3
+  backoff_base: 2.0   # detik; eksponensial 2s, 4s, 8s, ...
+  backoff_max: 60.0   # plafon per-jeda
+
+# --- Bobot skor (harus berjumlah 100) ----------------------------------------
+# severity: penalti per temuan keamanan, dikurangkan dari jatah "security".
+# Lihat docs/adr/002-fail-closed-scoring.md untuk alasannya.
+scoring:
+  build: 20
+  tests: 30
+  security: 30
+  review: 20
+  severity:
+    critical: 30
+    high: 15
+    medium: 5
+    low: 2
+    unknown: 5
+  # Plafon keras: build/test tak terverifikasi tak pernah masuk band rilis.
+  unverified_build_cap: 60
+  # Plafon keras: satu temuan CRITICAL menggagalkan gate.
+  critical_finding_cap: 50
+
+# --- Koneksi ke OpenRouter ---------------------------------------------------
 openrouter:
   base_url: "https://openrouter.ai/api/v1"
-  # HANYA nama environment variable, BUKAN API key itu sendiri.
+  # HANYA nama environment variable, BUKAN API key-nya.
   # Export di shell:  export OPENROUTER_API_KEY=sk-or-...
   api_key_env: "OPENROUTER_API_KEY"
-  site_url: ""            # opsional, buat ranking di openrouter.ai
+  site_url: ""            # opsional, untuk ranking di openrouter.ai
   site_name: "Looper Daemon"
 
-# --- Role -> model, sesuai tabel ROLE & MODEL ASSIGNMENT ---------------
-# Field opsional: model, role, temperature, max_tokens.
-# Model di bawah bisa di-upgrade kapan saja (mis. anthropic/claude-sonnet-4,
-# openai/gpt-5.1, google/gemini-2.5-pro, deepseek/deepseek-r1-0528) cukup
-# ganti string "model" di sini -- tidak perlu sentuh kode.
+# --- Role -> model -----------------------------------------------------------
+# Field opsional per agent: model, role, temperature, max_tokens.
+# Ganti string "model" kapan saja tanpa menyentuh kode.
 agents:
   researcher:
     model: "deepseek/deepseek-r1"
@@ -65,7 +103,7 @@ agents:
   fixer:
     model: "anthropic/claude-3.5-sonnet"
 
-# --- Phase yang dijalankan (opsional, override default di kode) --------
+# --- Phase yang dijalankan (opsional) ----------------------------------------
 # phases:        siklus pertama (pipeline lengkap)
 # retry_phases:  siklus ulang setelah fix (hanya re-validasi)
 # final_phases:  sekali jalan setelah gate skor terpenuhi

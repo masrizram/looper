@@ -1,5 +1,6 @@
-# Looper Daemon runtime dependencies
+# Looper Daemon runtime dependencies.
+# Dev/CI tooling lives in the [project.optional-dependencies] "dev" extra
+# in pyproject.toml -- install with: pip install -e ".[dev]"
 openai>=1.30
 aiohttp>=3.9
 pyyaml>=6.0
-pytest>=8.0

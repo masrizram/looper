@@ -1,190 +1,194 @@
-# 🔁 Looper Daemon
+# Looper Daemon
 
-**Autonomous AI Software Engineering System** — menjalankan pipeline multi-agent
-(Research → Architecture → Build → Test → Review → Security Audit → Fix →
-Performance → Docs) secara otomatis dari satu goal, 24/7 di background.
+An autonomous multi-agent pipeline that turns a one-sentence goal into working,
+reviewed, security-audited software. Ten specialised LLM agents run in a scored
+loop: build → test → review → audit → fix, repeating until the artifact clears
+a release gate or the cycle budget runs out.
 
-Semua agent (kecuali Orchestrator) dipanggil lewat **OpenRouter**
-(`https://openrouter.ai/api/v1`) — satu API key untuk banyak model LLM.
-
----
-
-## ✨ Fitur
-
-- **Pipeline lengkap**: 10 role agent (Researcher, Architect, UX/API Designer,
-  Builder, Tester, Reviewer, Security Auditor, Performance Optimizer,
-  Documentation Writer, Fixer).
-- **Scoring engine** (0–100): build + test + security + review → keputusan
-  otomatis retry / fix / finish.
-- **Dua trigger**: file watcher (`looper_commands.txt`) dan HTTP API (`/build`).
-- **Aman**: HTTP API bind `127.0.0.1` + bearer-token auth (default), tidak ada
-  secret hardcode (API key dari environment variable).
-- **Robust**: retry + exponential backoff pada tiap LLM call, state atomic-write,
-  graceful handling bila agent gagal (tidak lolos secara palsu).
-- **Teruji**: 23 unit/integration test (coverage ~82%) + CI GitHub Actions.
+> **Read this first:** `POST /build` runs code written by a language model.
+> Treat it as remote code execution by design. See [SECURITY.md](SECURITY.md).
 
 ---
 
-## 📋 Prasyarat
-
-- Python **3.11+**
-- Akun **OpenRouter** + API key (`https://openrouter.ai/keys`)
-
----
-
-## 🚀 Instalasi
+## Quick start
 
 ```bash
-# 1. Clone
-git clone https://github.com/masrizram/looper.git
-cd looper
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
 
-# 2. Install dependency
-pip install -r requirements.txt
+export OPENROUTER_API_KEY=sk-or-...
 
-# 3. Siapkan config (sudah ada config.yaml default; edit sesuai kebutuhan)
-#    Pastikan nama file config = config.yaml (atau looper_config.yaml)
-
-# 4. Set environment variable (PENTING - jangan hardcode key di config!)
-export OPENROUTER_API_KEY="sk-or-..."          # wajib
-export LOOPER_HTTP_TOKEN="token_rahasia_anda"   # opsional, untuk auth API HTTP
+python -m looper.cli --check-config                 # validate config.yaml
+python -m looper.cli --goal "build a CLI todo app"  # one build, then exit
+python -m looper.cli --daemon                       # 24/7: HTTP + file watcher
 ```
 
-> 💡 `config.yaml` hanya menyimpan **nama** environment variable
-> (`api_key_env: OPENROUTER_API_KEY`), bukan key itu sendiri. Aman untuk di-commit.
+`python daemon.py --goal "..."` still works — `daemon.py` is a compatibility
+shim over the `looper` package.
 
 ---
 
-## 🎮 Cara Penggunaan
+## How it works
 
-### Mode 1 — Daemon (24/7, trigger via file atau HTTP)
+```
+goal ──> ┌─────────────── cycle 1 ────────────────┐
+         │ research → architecture → build →      │
+         │ test → review → security_audit         │
+         └────────────────┬───────────────────────┘
+                          │  score
+              ┌───────────┴────────────┐
+     score >= target?             score < min_acceptable?
+              │                          │
+             done                     fix ──> cycle 2..N
+                                        (test/review/audit only)
+                          │
+              score >= min_acceptable
+                          │
+              performance_optimize → documentation
+```
+
+### The agents
+
+| Phase | Agent | Produces |
+|---|---|---|
+| `research` | Researcher | `research.md` |
+| `architecture` | Architect + UX/API Designer | `design.md` |
+| `build` | Code Builder | `generated_code.py` |
+| `test` | Test Generator | `test_generated.py`, then runs pytest |
+| `review` | Senior Reviewer | `review.md` + a 0–100 score |
+| `security_audit` | Security Auditor | `security_audit.md` + findings |
+| `performance_optimize` | Optimizer | `optimized_code.py` |
+| `documentation` | Doc Writer | `README_generated.md` |
+| `fix` | Expert Fixer | patched code, promoted to canonical |
+
+Phase lists are configurable — see the commented block in `config.yaml`.
+
+---
+
+## Scoring
+
+Points are additive, then **hard caps** are applied. See
+[ADR-002](docs/adr/002-fail-closed-scoring.md).
+
+| Component | Max |
+|---|---|
+| Build succeeded | 20 |
+| Tests passed (proportional) | 30 |
+| Security (30 − weighted penalties) | 30 |
+| Reviewer score | 20 |
+
+Penalties per finding: `CRITICAL 30 · HIGH 15 · MEDIUM 5 · LOW 2`.
+
+**Hard caps** — no amount of good news overrides these:
+
+- No successful build, **or zero tests** → capped at **60**
+- Any `CRITICAL` finding → capped at **50**
+
+A failed security agent emits `CRITICAL: security audit did not complete`. An
+outage never reads as "no issues found".
+
+---
+
+## Triggering builds
+
+**File watcher** — write a goal into `looper_commands.txt`:
 
 ```bash
-python daemon.py --daemon
+echo "build a URL shortener" >> looper_commands.txt
 ```
 
-- **File watcher**: tulis goal ke `looper_commands.txt`, daemon otomatis memproses.
-  ```bash
-  echo "Build a FastAPI REST API for a todo app" > looper_commands.txt
-  ```
-- **HTTP API**: kirim POST ke `http://127.0.0.1:9999/build`
-  ```bash
-  curl -X POST http://127.0.0.1:9999/build \
-    -H "Authorization: Bearer $LOOPER_HTTP_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"goal": "Build a FastAPI REST API for a todo app"}'
-  ```
+**HTTP API** (`--daemon` mode):
 
-### Mode 2 — Sekali Jalan (single goal)
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/build` | token | Start a build: `{"goal": "..."}` |
+| GET | `/status` | token | Full state: cycle, score, breakdown, history |
+| GET | `/health` | none | Liveness; leaks nothing |
+| GET | `/metrics` | token | Counters + uptime |
 
 ```bash
-python daemon.py --goal "Build a FastAPI REST API for a todo app"
+export LOOPER_HTTP_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+curl -X POST localhost:9999/build \
+     -H "Authorization: Bearer $LOOPER_HTTP_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"goal":"build a URL shortener"}'
 ```
 
-### Mode 3 — Reset State
+Protections: constant-time token comparison, per-IP rate limiting, request body
+and goal length caps, and a startup **refusal** to bind `0.0.0.0` without a token.
+
+---
+
+## Configuration
+
+Everything lives in `config.yaml`; all fields are optional. **Secrets never go
+in this file** — it stores only the *names* of environment variables.
+
+| Env var | Purpose |
+|---|---|
+| `OPENROUTER_API_KEY` | OpenRouter credential (required for real runs) |
+| `LOOPER_HTTP_TOKEN` | Bearer token for `/build`, `/status`, `/metrics` |
+
+Validate before deploying:
 
 ```bash
-python daemon.py --reset
+python -m looper.cli --check-config
 ```
 
-### Opsi CLI Lain
+### CLI
 
-| Flag | Fungsi |
-|------|--------|
-| `--goal "..."` | Jalankan satu build untuk goal tertentu |
-| `--daemon` | Jalankan sebagai daemon (watcher + HTTP server) |
-| `--reset` | Hapus state (`looper_state.json`) |
-| `--config path.yaml` | Pakai file config khusus (default: `config.yaml`, fallback `looper_config.yaml`) |
+| Flag | Effect |
+|---|---|
+| `--goal "..."` | Run one build, exit non-zero if below `min_acceptable` |
+| `--daemon` | Run HTTP server + file watcher until signalled |
+| `--check-config` | Validate config and exit |
+| `--reset` | Clear persisted state |
+| `--config PATH` | Use a specific config file |
+| `--json-logs` | Structured JSON logs for log shippers |
+| `--log-level` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+
+Exit codes: `0` ok · `1` config error · `2` build below minimum.
 
 ---
 
-## ⚙️ Konfigurasi (`config.yaml`)
+## Layout
 
-```yaml
-workspace: "./workspace"          # direktori hasil generate
-state_file: "./looper_state.json"
-watch_file: "./looper_commands.txt"
-
-http:
-  bind: "127.0.0.1"               # hanya localhost (aman). Ganti 0.0.0.0 HANYA di belakang proxy ber-auth
-  port: 9999
-  auth_token_env: "LOOPER_HTTP_TOKEN"   # nama env var untuk bearer token
-
-execution:
-  max_cycles: 5                   # batas siklus retry
-  target_score: 99                # berhenti jika skor >= ini
-  min_acceptable: 95              # di bawah ini -> jalankan fixer
-
-openrouter:
-  base_url: "https://openrouter.ai/api/v1"
-  api_key_env: "OPENROUTER_API_KEY"   # HANYA nama env var
-  site_url: ""
-  site_name: "Looper Daemon"
-
-agents:                           # ganti model kapan saja tanpa ubah kode
-  builder:
-    model: "anthropic/claude-3.5-sonnet"
-  # ...lihat config.yaml lengkap
+```
+looper/
+  config.py        frozen, validated config tree
+  state.py         atomic writes, bounded history
+  scoring.py       severity weighting + release gates
+  testparse.py     pytest output parsing
+  prompts.py       pure prompt templates
+  llm.py           OpenRouter client, retries, backoff
+  phases.py        pipeline stages, workspace containment
+  server.py        HTTP control plane
+  watcher.py       file-trigger polling
+  orchestrator.py  the control loop
+  cli.py           argv, logging, signals -- all side effects
+daemon.py          compatibility shim
+docs/adr/          architecture decision records
 ```
 
-> 🔒 **Keamanan**: jangan pernah menulis API key langsung di `config.yaml`.
-> Selalu lewat environment variable.
+Importing any module has **no side effects** — no config read, no network
+client, no file I/O. See [ADR-001](docs/adr/001-package-layout-and-immutable-config.md).
 
 ---
 
-## 🧪 Testing & Lint
+## Development
 
 ```bash
-pytest                  # jalankan 23 test (tanpa butuh API key)
-pytest --cov=daemon     # lihat coverage
-black --check daemon.py tests/     # cek format
-flake8 daemon.py tests/            # cek lint
+black --check looper/ tests/ daemon.py
+isort --check-only looper/ tests/ daemon.py
+flake8 looper/ tests/ daemon.py
+mypy looper/ daemon.py --strict
+pytest --cov=looper --cov=daemon --cov-branch --cov-fail-under=100
+bandit -r looper/ daemon.py -ll
+pip-audit -r requirements.txt --strict
 ```
 
-CI GitHub Actions (`.github/workflows/ci.yml`) otomatis menjalankan lint + test
-setiap push/PR.
+Coverage is pinned at **100% line and branch**. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+## License
 
-## 🗂️ Struktur Output
-
-Setelah build, hasil ada di `workspace/`:
-
-```
-workspace/
-├── research.md
-├── architecture/
-│   └── design.md
-├── src/
-│   ├── generated_code.py
-│   └── optimized_code.py
-├── tests/
-│   └── test_generated.py
-├── review.md
-├── security_audit.md
-└── docs/
-    └── README.md
-```
-
-State progres disimpan di `looper_state.json` (di-ignore oleh git).
-
----
-
-## 📊 Skor Kualitas (hasil audit)
-
-| Aspek | Skor |
-|-------|:----:|
-| Keamanan | 98 |
-| Coding Standard | 100 |
-| Performa | 95 |
-| Konfigurasi | 100 |
-| Maintainability | 98 |
-| Testing | 100 |
-
-Lihat `audit_result.md` untuk detail lengkap.
-
----
-
-## 📝 Lisensi
-
-MIT — bebas digunakan & dimodifikasi.
+MIT — see [LICENSE](LICENSE).
