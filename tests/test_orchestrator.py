@@ -304,3 +304,24 @@ def test_zero_score_when_no_cycle_produced_a_result(raw_config, daemon_factory, 
     assert original_max >= 1
     score = asyncio.run(daemon.build("goal"))
     assert isinstance(score, float)
+
+
+def test_build_aborts_when_cost_budget_exceeded(raw_config, daemon_factory, stub_pytest_run):
+    """#1: the loop must hard-stop (and not spend more) once the USD ceiling is hit."""
+    from looper.config import CostBudgetExceeded
+    from looper.llm import OpenRouterClient
+
+    config = cfg_from(raw_config, execution={"max_cost_usd": 0.50, "max_cycles": 5})
+    daemon = daemon_factory(cfg=config)
+    # Force the client to report a spend already above the ceiling.
+    expensive = OpenRouterClient(config.openrouter, config.retry, client=object())
+    expensive.total_usage = expensive.total_usage  # unchanged
+    expensive._default_price = 1.0  # $1 / 1K tokens
+    expensive.total_usage = type(expensive.total_usage)(
+        prompt_tokens=10_000, completion_tokens=0
+    )  # 10K tokens * $1/1K = $10 > $0.50
+    daemon.client = expensive
+
+    with pytest.raises(CostBudgetExceeded):
+        asyncio.run(daemon.build("goal"))
+    assert daemon.state.state["status"] == "cost_exhausted"

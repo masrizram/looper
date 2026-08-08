@@ -6,9 +6,10 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from looper.config import LooperConfig
+from looper.config import CostBudgetExceeded, LooperConfig
 from looper.llm import OpenRouterClient
 from looper.phases import CycleEvidence, PhaseManager, PhaseResult
 from looper.scoring import ScoreBreakdown, ScoringEngine
@@ -38,11 +39,20 @@ class LooperDaemon:
         phases: PhaseManager | None = None,
         server: HTTPServer | None = None,
         watcher: FileWatcher | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         self.config = config
+        self._config_dir = Path(config_dir) if config_dir else None
         self.state = state or StateManager(config.state_file, config.execution.max_history_entries)
-        self.client = client or OpenRouterClient(config.openrouter, config.retry)
-        self.phases = phases or PhaseManager(config, self.state, self.client)
+        self.client = client or OpenRouterClient(
+            config.openrouter,
+            config.retry,
+            model_prices_usd_per_1k=config.execution.model_prices_usd_per_1k,
+            default_token_price_usd=config.execution.default_token_price_usd,
+        )
+        self.phases = phases or PhaseManager(
+            config, self.state, self.client, config_dir=self._config_dir
+        )
         self.scoring = ScoringEngine(config.scoring)
         self.watcher = watcher or FileWatcher(
             config.watch_file, self._on_command, config.watch_interval
@@ -120,6 +130,22 @@ class LooperDaemon:
         cycle = 0
 
         while cycle < execution.max_cycles:
+            # Hard cost ceiling: abort before spending more, rather than
+            # silently running up the API bill. ADR-005.
+            if (
+                execution.max_cost_usd > 0
+                and self.client.running_cost_usd() >= execution.max_cost_usd
+            ):
+                logger.error(
+                    "Cost budget %.2f USD exhausted at cycle %d (spent %.2f); aborting.",
+                    execution.max_cost_usd,
+                    cycle,
+                    self.client.running_cost_usd(),
+                )
+                self.state.update(status="cost_exhausted")
+                self.state.save()
+                raise CostBudgetExceeded(self.client.running_cost_usd(), execution.max_cost_usd)
+
             cycle += 1
             self.state.update(cycle=cycle)
             self.state.save()

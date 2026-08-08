@@ -22,10 +22,10 @@ from looper.state import StateManager
 from .conftest import DEFAULT_REPLIES, make_client
 
 
-def build_phases(config, replies=None, fail_with=None) -> PhaseManager:
+def build_phases(config, replies=None, fail_with=None, config_dir=None) -> PhaseManager:
     state = StateManager(config.state_file, config.execution.max_history_entries)
     client = make_client(config, replies, fail_with)
-    return PhaseManager(config, state, client)
+    return PhaseManager(config, state, client, config_dir=config_dir)
 
 
 # --- PhaseResult contract (A-4) ---------------------------------------------
@@ -342,8 +342,8 @@ def test_subprocess_argv_is_hardened(config, monkeypatch):
     """Fixed argv, isolated mode, no cache writes, hard timeout."""
     captured = {}
 
-    async def fake_to_thread(func, argv, **kwargs):
-        captured["argv"] = argv
+    async def fake_to_thread(func, *args, **kwargs):
+        captured["argv"] = kwargs.get("argv") or (args[0] if args else None)
         captured["kwargs"] = kwargs
 
         class Proc:
@@ -354,7 +354,28 @@ def test_subprocess_argv_is_hardened(config, monkeypatch):
         return Proc()
 
     monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
-    phases = build_phases(config)
+    # Disable the adequacy floor and supply a clean, dense suite so the run
+    # actually reaches the pytest subprocess (otherwise it is refused first).
+    import looper.config as cfg_mod
+
+    raw = {
+        "workspace": config.workspace,
+        "state_file": config.state_file,
+        "http": {"bind": config.http.bind, "port": config.http.port},
+        "execution": {
+            "min_test_assertions_per_100_lines": 0,
+            "sandbox_tests": False,
+        },
+    }
+    no_floor = cfg_mod.build_config(raw, env={})
+    phases = build_phases(
+        no_floor,
+        replies={
+            **DEFAULT_REPLIES,
+            "Code Builder": "print('ok')",
+            "Test Generator": "def test_x():\n    assert True\n    assert 1 == 1\n",
+        },
+    )
     asyncio.run(phases.run_test("goal"))
 
     argv = captured["argv"]
@@ -492,3 +513,209 @@ def test_truncation_does_not_split_a_utf8_character(raw_config):
     phases = build_phases(config)
     phases.write_file("uni.md", "\u00e9" * 2000)  # 2 bytes each
     assert "TRUNCATED by looper" in phases.read_file("uni.md")
+
+
+# --- Audit remediation: sandbox, adequacy, lint, scope guard (ADR-005..7) ----
+
+DESTRUCTIVE_TEST = "import os\n\ndef test_x():\n    os.system('echo pwned')\n"
+
+
+def test_generated_suite_with_destructive_call_is_refused(config):
+    """#5: code that shells out must be refused, not executed on the host."""
+    phases = build_phases(
+        config,
+        replies={
+            **DEFAULT_REPLIES,
+            "Code Builder": "print('ok')",
+            "Test Generator": DESTRUCTIVE_TEST,
+        },
+    )
+    result = asyncio.run(phases.run_test("goal"))
+    assert result.tests_passed == 0
+    assert "dangerous" in result.summary.lower() or "refused" in result.summary.lower()
+
+
+def test_generated_suite_with_trivial_assert_is_refused(config):
+    """#3: a single assert True cannot let the build score green."""
+    phases = build_phases(
+        config,
+        replies={
+            **DEFAULT_REPLIES,
+            "Code Builder": "print('ok')",
+            # A long suite with only one assertion is too thin (below the
+            # assertions/100-lines floor) and must be refused.
+            "Test Generator": "def test_x():\n    assert True\n"
+            + "\n".join(f"# padding {i}" for i in range(40))
+            + "\n",
+        },
+    )
+    result = asyncio.run(phases.run_test("goal"))
+    assert "inadequate" in (result.error or "").lower() or result.tests_passed == 0
+
+
+def test_lint_gate_fails_generated_code_with_syntax_error(config):
+    """#4: code that does not even compile must be rejected, not accepted."""
+    phases = build_phases(
+        config, replies={**DEFAULT_REPLIES, "Code Builder": "def broken(:\n    pass\n"}
+    )
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is False
+
+
+def test_lint_off_accepts_code(config):
+    """#4: lint_generated=off skips the compile gate entirely."""
+    import looper.config as cfg_mod
+
+    raw = {
+        "workspace": config.workspace,
+        "state_file": config.state_file,
+        "http": {"bind": config.http.bind, "port": config.http.port},
+        "execution": {"lint_generated": "off"},
+    }
+    no_lint = cfg_mod.build_config(raw, env={})
+    phases = build_phases(no_lint, replies={**DEFAULT_REPLIES, "Code Builder": "x=1\nprint(x)\n"})
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is True
+
+
+def test_flake8_lint_gate_rejects_ugly_code(config):
+    """#4: lint_generated=flake8 must reject code that fails the style gate."""
+    import looper.config as cfg_mod
+
+    raw = {
+        "workspace": config.workspace,
+        "state_file": config.state_file,
+        "http": {"bind": config.http.bind, "port": config.http.port},
+        "execution": {"lint_generated": "flake8"},
+    }
+    flake8_cfg = cfg_mod.build_config(raw, env={})
+    # A line far over 100 chars trips flake8's E501 -> build must fail.
+    ugly = "x = " + "1" * 200 + "\n"
+    phases = build_phases(flake8_cfg, replies={**DEFAULT_REPLIES, "Code Builder": ugly})
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is False
+
+
+def test_flake8_lint_gate_accepts_clean_code(config):
+    """#4: lint_generated=flake8 must accept code that passes the style gate."""
+    import looper.config as cfg_mod
+
+    raw = {
+        "workspace": config.workspace,
+        "state_file": config.state_file,
+        "http": {"bind": config.http.bind, "port": config.http.port},
+        "execution": {"lint_generated": "flake8"},
+    }
+    flake8_cfg = cfg_mod.build_config(raw, env={})
+    clean = "def add(a, b):\n    return a + b\n"
+    phases = build_phases(flake8_cfg, replies={**DEFAULT_REPLIES, "Code Builder": clean})
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is True
+
+
+def test_user_tests_failure_is_propagated(tmp_path, raw_config):
+    """#3: if the user suite fails, the failure must surface in the result."""
+    user_dir = tmp_path / "user_tests"
+    user_dir.mkdir()
+    (user_dir / "test_user.py").write_text(
+        "def test_must_fail():\n    assert False\n",
+        encoding="utf-8",
+    )
+    config = build_config(
+        {**raw_config, "execution": {"user_tests_dir": str(user_dir)}},
+        env={},
+    )
+    phases = build_phases(
+        config,
+        config_dir=tmp_path,
+        replies={**DEFAULT_REPLIES, "Code Builder": "print('hello')"},
+    )
+    asyncio.run(phases.run_build("goal"))
+    result = asyncio.run(phases.run_test("goal"))
+    assert "user suite" in result.summary
+    assert "1 failed" in result.summary
+
+
+def test_relative_user_tests_dir_is_resolved_against_config_dir(tmp_path, raw_config):
+    """#3: a relative user_tests_dir is resolved via the config dir."""
+    user_dir = tmp_path / "user_tests"
+    user_dir.mkdir()
+    (user_dir / "test_user.py").write_text(
+        "def test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+    config = build_config(
+        {**raw_config, "execution": {"user_tests_dir": "user_tests"}},
+        env={},
+    )
+    phases = build_phases(
+        config,
+        config_dir=tmp_path,
+        replies={**DEFAULT_REPLIES, "Code Builder": "print('hello')"},
+    )
+    asyncio.run(phases.run_build("goal"))
+    result = asyncio.run(phases.run_test("goal"))
+    assert "user suite" in result.summary
+
+
+def test_test_phase_without_generated_suite_reports_missing(tmp_path, raw_config):
+    """#5: a missing generated test file must fail closed, not crash."""
+    config = build_config(
+        {**raw_config, "execution": {"min_test_assertions_per_100_lines": 0}},
+        env={},
+    )
+    phases = build_phases(
+        config,
+        replies={**DEFAULT_REPLIES, "Code Builder": "print('ok')"},
+    )
+    asyncio.run(phases.run_build("goal"))
+    # Run the untrusted-suite executor directly with NO test file present.
+    passed, failed, note = asyncio.run(phases._execute_generated_tests())
+    assert passed == 0
+    assert failed == 1
+    assert "test file missing" in note
+
+
+def test_user_tests_run_when_configured(tmp_path, raw_config):
+    """#3: a user-owned suite (unseen by the AI) must also pass."""
+    user_dir = tmp_path / "user_tests"
+    user_dir.mkdir()
+    (user_dir / "test_user.py").write_text(
+        "from pathlib import Path\n"
+        "def test_generated_runs():\n"
+        "    src = Path('src/generated_code.py').read_text()\n"
+        "    assert 'print' in src\n",
+        encoding="utf-8",
+    )
+    config = build_config(
+        {**raw_config, "execution": {"user_tests_dir": str(user_dir)}},
+        env={},
+    )
+    phases = build_phases(
+        config,
+        config_dir=tmp_path,
+        replies={**DEFAULT_REPLIES, "Code Builder": "print('hello')"},
+    )
+    # Build so generated_code.py exists, then run the test phase.
+    asyncio.run(phases.run_build("goal"))
+    result = asyncio.run(phases.run_test("goal"))
+    assert "user suite" in result.summary
+
+
+def test_scope_guard_injected_into_every_prompt():
+    """#2: the anti-drift directive must appear in each agent's prompt."""
+    from looper.prompts import PromptGenerator
+
+    gen = PromptGenerator()
+    for prompt in (
+        gen.research("g"),
+        gen.architecture("g", "r"),
+        gen.build("g", "a"),
+        gen.test("g", "c"),
+        gen.review("g", "c"),
+        gen.security_audit("g", "c"),
+        gen.performance_optimize("g", "c"),
+        gen.documentation("g", "a", "c"),
+        gen.fix("g", "c", ["HIGH: x"]),
+    ):
+        assert "Stay strictly within the goal" in prompt

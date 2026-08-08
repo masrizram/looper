@@ -11,7 +11,7 @@ import sys
 from typing import Any, Sequence
 
 from looper import __version__
-from looper.config import ConfigError, LooperConfig, load_config
+from looper.config import ConfigError, CostBudgetExceeded, load_config_with_dir
 from looper.orchestrator import LooperDaemon
 
 logger = logging.getLogger("looper.cli")
@@ -19,6 +19,7 @@ logger = logging.getLogger("looper.cli")
 EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
 EXIT_BUILD_BELOW_MINIMUM = 3
+EXIT_COST_EXCEEDED = 4
 EXIT_INTERRUPTED = 130
 
 
@@ -111,7 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     setup_logging(args.log_level, args.json_logs)
 
     try:
-        config: LooperConfig = load_config(args.config)
+        config, config_dir = load_config_with_dir(args.config)
     except (ConfigError, FileNotFoundError) as exc:
         logger.error("Configuration error: %s", exc)
         return EXIT_CONFIG_ERROR
@@ -126,7 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_OK
 
-    daemon = LooperDaemon(config)
+    daemon = LooperDaemon(config, config_dir=config_dir)
 
     if args.reset:
         daemon.state.reset()
@@ -140,6 +141,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_OK if score >= config.execution.min_acceptable else EXIT_BUILD_BELOW_MINIMUM
         if args.daemon:
             return asyncio.run(_run_daemon(daemon))
+    except CostBudgetExceeded as exc:
+        logger.error("Build aborted: %s", exc)
+        return EXIT_COST_EXCEEDED
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         logger.info("Interrupted.")
         return EXIT_INTERRUPTED

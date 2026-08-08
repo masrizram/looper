@@ -47,6 +47,31 @@ execution:
   # Batas byte per file yang ditulis dari output agent. LLM yang ngeloop
   # bisa memenuhi disk daemon 24/7; kelebihannya dipotong + ditandai.
   max_file_bytes: 2000000
+  # Plafon biaya API per build (USD). 0 = tanpa batas. Lewati nilai ini ->
+  # build dihentikan paksa (exit code 4), bukan terus menumpuk tagihan. ADR-005.
+  max_cost_usd: 0.0
+  # Harga default USD per 1K token (dipakai estimasi biaya). Bisa diper-tight
+  # per model lewat model_prices_usd_per_1k (lihat contoh di bawah).
+  default_token_price_usd: 0.002
+  # model_prices_usd_per_1k:
+  #   "anthropic/claude-3.5-sonnet": 0.003
+  #   "openai/gpt-4o": 0.005
+  # Path ke suite pytest MILIK ANDA (relatif thd config atau absolut).
+  # Kode AI harus LULUS test ini juga sebelum build dianggap selesai --
+  # menutup celah overfitting (AI menulis test lemah untuk dirinya sendiri). ADR-06.
+  user_tests_dir: ""
+  # Tolak suite test buatan AI yang terlalu tipis (assert per 100 baris).
+  # 0 = nonaktifkan lantai ini.
+  min_test_assertions_per_100_lines: 6
+  # Jalankan pytest suite di bawah resource limit (CPU/wall/RSS) agar kode
+  # AI yang ngeloop/boros tak bisa gantung atau OOM host. Selalu scan statis
+  # suite dulu: panggilan os.system/subprocess/network/eval DITOLAK dijalankan. ADR-06.
+  sandbox_tests: true
+  sandbox_cpu_seconds: 60
+  sandbox_wall_seconds: 300
+  sandbox_rss_bytes: 1000000000
+  # Lint kode hasil AI sebelum diterima: py_compile (default) / flake8 / off.
+  lint_generated: "py_compile"
 
 # --- Kebijakan retry panggilan LLM -------------------------------------------
 retry:

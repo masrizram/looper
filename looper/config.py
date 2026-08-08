@@ -56,6 +56,18 @@ class ConfigError(ValueError):
     """Raised when the supplied configuration is invalid."""
 
 
+class CostBudgetExceeded(RuntimeError):
+    """Raised when a build's estimated API spend crosses ``max_cost_usd``.
+
+    Carries the spend so the CLI can report it and exit with code 4. ADR-005.
+    """
+
+    def __init__(self, spent_usd: float, limit_usd: float) -> None:
+        self.spent_usd = spent_usd
+        self.limit_usd = limit_usd
+        super().__init__(f"cost budget {limit_usd:.2f} USD exhausted (spent {spent_usd:.2f})")
+
+
 def _require_int(value: Any, name: str, low: int, high: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"{name} must be an int, got {value!r}")
@@ -220,6 +232,36 @@ class ExecutionConfig:
     #: Ceiling on any single file written from agent output. An LLM that
     #: loops can otherwise fill the disk of an unattended 24/7 daemon.
     max_file_bytes: int = 2_000_000
+    #: Hard cost ceiling in USD for a single `build`. When the running token
+    #: estimate crosses it the build is aborted hard (exit code 4) instead of
+    #: silently running up the bill. 0 disables the cap. ADR-005.
+    max_cost_usd: float = 0.0
+    #: Per-model USD price per 1K tokens, used to estimate spend from usage.
+    #: Missing models fall back to ``default_token_price_usd``. 0 == unknown.
+    model_prices_usd_per_1k: Mapping[str, float] = field(default_factory=dict)
+    default_token_price_usd: float = 0.002
+    #: Optional path (relative to --config dir or absolute) to a user-owned
+    #: pytest suite. If set, the generated code must ALSO pass the user's
+    #: tests before the build can clear the gate - closes the self-test
+    #: overfitting hole (an AI writing trivially-passing tests for itself).
+    user_tests_dir: str = ""
+    #: Reject generated test suites that look like they were written to pass
+    #: rather than to verify: require at least this many `assert`/raises per
+    #: hundred lines of generated test code, and forbid hardcoding the
+    #: expected score. 0 disables the floor.
+    min_test_assertions_per_100_lines: int = 6
+    #: Run the generated pytest suite under OS resource limits (CPU seconds,
+    #: wall clock, RSS) so a `while True`, fork bomb, or memory hog in
+    #: LLM-authored code cannot wedge or OOM the host. Always static-scan the
+    #: suite for destructive/network calls first and refuse to run it.
+    sandbox_tests: bool = True
+    sandbox_cpu_seconds: int = 60
+    sandbox_wall_seconds: int = 300
+    sandbox_rss_bytes: int = 1_000_000_000
+    #: Lint the generated code with `python -m py_compile`/flake8 before it is
+    #: accepted, so obviously-broken or style-corrupt output never reaches the
+    #: "done" state. Set to "off" to skip.
+    lint_generated: str = "py_compile"
 
     def __post_init__(self) -> None:
         _require_int(self.max_cycles, "execution.max_cycles", 1, 1000)
@@ -228,10 +270,36 @@ class ExecutionConfig:
         _require_int(self.test_timeout_seconds, "execution.test_timeout_seconds", 1, 86_400)
         _require_int(self.max_history_entries, "execution.max_history_entries", 1, 1_000_000)
         _require_int(self.max_file_bytes, "execution.max_file_bytes", 1024, 1_000_000_000)
+        _require_number(self.max_cost_usd, "execution.max_cost_usd", 0.0, 1_000_000.0)
+        _require_number(
+            self.default_token_price_usd,
+            "execution.default_token_price_usd",
+            0.0,
+            100.0,
+        )
+        _require_int(
+            self.min_test_assertions_per_100_lines,
+            "execution.min_test_assertions_per_100_lines",
+            0,
+            1000,
+        )
+        _require_int(self.sandbox_cpu_seconds, "execution.sandbox_cpu_seconds", 1, 86_400)
+        _require_int(self.sandbox_wall_seconds, "execution.sandbox_wall_seconds", 1, 86_400)
+        _require_int(
+            self.sandbox_rss_bytes,
+            "execution.sandbox_rss_bytes",
+            1_000_000,
+            1_000_000_000_000,
+        )
         if self.min_acceptable > self.target_score:
             raise ConfigError(
                 "execution.min_acceptable must be <= target_score, got "
                 f"min={self.min_acceptable}, target={self.target_score}"
+            )
+        if self.lint_generated not in ("off", "py_compile", "flake8"):
+            raise ConfigError(
+                "execution.lint_generated must be off|py_compile|flake8, got "
+                f"{self.lint_generated!r}"
             )
 
 
@@ -357,6 +425,16 @@ def build_config(
         test_timeout_seconds=exec_raw.get("test_timeout_seconds", 600),
         max_history_entries=exec_raw.get("max_history_entries", 500),
         max_file_bytes=exec_raw.get("max_file_bytes", 2_000_000),
+        max_cost_usd=exec_raw.get("max_cost_usd", 0.0),
+        model_prices_usd_per_1k=exec_raw.get("model_prices_usd_per_1k", {}),
+        default_token_price_usd=exec_raw.get("default_token_price_usd", 0.002),
+        user_tests_dir=exec_raw.get("user_tests_dir", ""),
+        min_test_assertions_per_100_lines=exec_raw.get("min_test_assertions_per_100_lines", 6),
+        sandbox_tests=exec_raw.get("sandbox_tests", True),
+        sandbox_cpu_seconds=exec_raw.get("sandbox_cpu_seconds", 60),
+        sandbox_wall_seconds=exec_raw.get("sandbox_wall_seconds", 300),
+        sandbox_rss_bytes=exec_raw.get("sandbox_rss_bytes", 1_000_000_000),
+        lint_generated=exec_raw.get("lint_generated", "py_compile"),
     )
 
     scoring_raw = section("scoring")
@@ -446,6 +524,19 @@ def load_config(
     With no ``path``, tries the known default filenames in order so a repo
     carrying either ``config.yaml`` or ``looper_config.yaml`` works.
     """
+    config, _ = load_config_with_dir(path, env=env)
+    return config
+
+
+def load_config_with_dir(
+    path: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[LooperConfig, Path | None]:
+    """Like :func:`load_config`, but also returns the resolved config dir.
+
+    The dir is used to resolve a relative ``execution.user_tests_dir`` so the
+    daemon does not depend on the caller's CWD.
+    """
     candidates: list[str | os.PathLike[str]]
     candidates = [path] if path is not None else list(DEFAULT_CONFIG_FILENAMES)
 
@@ -458,7 +549,8 @@ def load_config(
         except yaml.YAMLError as exc:
             raise ConfigError(f"{candidate} is not valid YAML: {exc}") from exc
         logger.info("Loading config from %s", candidate)
-        return build_config(parsed, env=env)
+        resolved = Path(candidate).resolve() if Path(candidate).exists() else None
+        return build_config(parsed, env=env), (resolved.parent if resolved else None)
 
     if path is not None:
         raise FileNotFoundError(f"Config file not found: {path}")

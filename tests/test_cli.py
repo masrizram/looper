@@ -12,6 +12,7 @@ import yaml
 from looper.cli import (
     EXIT_BUILD_BELOW_MINIMUM,
     EXIT_CONFIG_ERROR,
+    EXIT_COST_EXCEEDED,
     EXIT_OK,
     JSONLogFormatter,
     build_parser,
@@ -42,7 +43,7 @@ def no_network(monkeypatch):
     class StubDaemon:
         last_instance = None
 
-        def __init__(self, config):
+        def __init__(self, config, **kwargs):
             self.config = config
             self.reset_called = False
             self.built = []
@@ -328,3 +329,16 @@ def test_run_daemon_ignores_absent_signals(config_file, no_network, monkeypatch)
             return None
 
     assert asyncio.run(cli._run_daemon(Quick(config=None))) == EXIT_OK
+
+
+def test_cost_budget_exceeded_returns_exit_4(config_file, no_network, monkeypatch):
+    """#1: a build that blows its USD budget must exit 4, not keep spending."""
+    from looper import cli
+    from looper.config import CostBudgetExceeded
+
+    class Broke(no_network):
+        async def build(self, goal):
+            raise CostBudgetExceeded(2.5, 1.0)
+
+    monkeypatch.setattr(cli, "LooperDaemon", Broke)
+    assert main(["--goal", "g"]) == EXIT_COST_EXCEEDED

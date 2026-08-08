@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import Mapping
 
 from looper.config import AgentSpec, OpenRouterConfig, RetryPolicy
 
@@ -84,6 +85,10 @@ class TokenUsage:
             "total_tokens": self.total_tokens,
         }
 
+    def estimated_cost_usd(self, price_per_1k: float) -> float:
+        """Rough spend in USD for this usage at ``price_per_1k`` USD / 1K tokens."""
+        return round(self.total_tokens / 1000.0 * price_per_1k, 6)
+
 
 def usage_of(response: object) -> TokenUsage:
     """Read ``response.usage`` defensively; providers may omit it entirely."""
@@ -138,11 +143,15 @@ class OpenRouterClient:
         *,
         client: object | None = None,
         sdk: object | None = None,
+        model_prices_usd_per_1k: Mapping[str, float] | None = None,
+        default_token_price_usd: float = 0.002,
     ) -> None:
         self.config = openrouter
         self.retry = retry
         self.total_usage = TokenUsage()
         self.call_count = 0
+        self._model_prices = dict(model_prices_usd_per_1k or {})
+        self._default_price = default_token_price_usd
 
         if client is not None:
             self._client = client
@@ -275,3 +284,11 @@ class OpenRouterClient:
             error=str(error),
             timed_out=timed_out,
         )
+
+    def model_price_per_1k(self, model: str) -> float:
+        """USD price per 1K tokens for ``model``, or the configured default."""
+        return float(self._model_prices.get(model, self._default_price))
+
+    def running_cost_usd(self) -> float:
+        """Estimated spend so far across every agent call in this run."""
+        return round(self.total_usage.estimated_cost_usd(self._default_price), 6)

@@ -8,6 +8,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+#: Injected into every prompt so a long loop cannot drift the agents off the
+#: original goal (context rot / scope creep). ADR-007.
+SCOPE_GUARD = (
+    "Stay strictly within the goal above. Do NOT add features, refactor "
+    "unrelated code, change configuration, install packages, run shell "
+    "commands, or touch files outside what this phase produces. If a "
+    "request is out of scope, say so and stop. Do not 'hallucinate' changes "
+    "to satisfy a test."
+)
+
 
 class PromptGenerator:
     """Builds the user-message text for each phase."""
@@ -19,7 +29,7 @@ class PromptGenerator:
             "tech stack, libraries, and architecture for this project:\n\n"
             f"{goal}\n\n"
             "Provide: recommended stack, rationale, alternatives, and pitfalls. "
-            "Output as structured markdown."
+            f"Output as structured markdown.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -29,7 +39,7 @@ class PromptGenerator:
             f"{goal}\n\n"
             f"Based on this research:\n{research}\n\n"
             "Provide: components, data models, API design, security, deployment, "
-            "and folder structure. Output as structured markdown."
+            f"and folder structure. Output as structured markdown.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -40,7 +50,8 @@ class PromptGenerator:
             f"Architecture:\n{architecture}\n\n"
             "Propose intuitive API endpoints (or CLI/UX flow if there's no API), "
             "naming conventions, request/response shapes, and error-handling "
-            "patterns that maximize developer experience. Output as structured markdown."
+            f"patterns that maximize developer experience. Output as "
+            f"structured markdown.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -51,7 +62,7 @@ class PromptGenerator:
             f"Based on this architecture:\n{architecture}\n\n"
             "Rules: NO placeholders, NO TODOs, NO incomplete code. "
             "Every file must be complete and functional. Include tests. "
-            "Output each file in a separate code block with filename header."
+            f"Output each file in a separate code block with filename header.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -61,7 +72,8 @@ class PromptGenerator:
             f"for:\n\n{goal}\n\n"
             f"Code under test:\n{code}\n\n"
             "Cover: edge cases, error handling, happy paths. Output pytest code "
-            "only, importing from the module under test."
+            f"only, importing from the module under test. The tests must genuinely "
+            f"exercise the code's behavior, not hardcode expected results.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -74,7 +86,7 @@ class PromptGenerator:
             "Check: security vulnerabilities, performance issues, code quality, "
             "best practices, missing tests. Provide a severity rating "
             "(critical/high/medium/low) per finding, and end with a line in the "
-            "exact format 'Score: <0-100>'."
+            f"exact format 'Score: <0-100>'.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -86,7 +98,7 @@ class PromptGenerator:
             "Look for injection flaws, auth/authorization issues, secrets handling, "
             "input validation gaps, and other vulnerabilities. List each finding as "
             "its own bullet starting with the severity, e.g. '- HIGH: <description>'. "
-            "If there are no issues, say 'No issues found.'"
+            f"If there are no issues, say 'No issues found.'\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -97,7 +109,7 @@ class PromptGenerator:
             f"Code:\n{code}\n\n"
             "Identify time/space complexity issues, unnecessary work, and resource "
             "waste. Provide the optimized code plus a short summary of what changed "
-            "and why."
+            f"and why.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -108,7 +120,7 @@ class PromptGenerator:
             f"Architecture:\n{architecture}\n\n"
             f"Code:\n{code}\n\n"
             "Produce a README with: overview, setup, usage, API/CLI reference, and "
-            "configuration. Output as markdown."
+            f"configuration. Output as markdown.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod
@@ -120,4 +132,5 @@ class PromptGenerator:
             f"Current code:\n{code}\n\n"
             f"Issues to fix:\n{issues_text}\n\n"
             "Provide the corrected, complete code for each affected file."
+            f"\n\n{SCOPE_GUARD}"
         )

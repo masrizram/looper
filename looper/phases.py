@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from looper.adequacy import evaluate_suite
 from looper.config import LooperConfig
 from looper.llm import AgentReply, OpenRouterClient
 from looper.prompts import PromptGenerator
+from looper.sandbox import run_sandboxed, scan_for_dangerous_calls
 from looper.scoring import NO_ISSUES_MARKERS, parse_security_findings
 from looper.state import StateManager
 from looper.testparse import parse_test_summary
@@ -147,6 +149,7 @@ class PhaseManager:
         client: OpenRouterClient,
         *,
         prompts: PromptGenerator | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -154,6 +157,9 @@ class PhaseManager:
         self.prompts = prompts or PromptGenerator()
         self.workspace = Path(config.workspace)
         self.workspace.mkdir(parents=True, exist_ok=True)
+        # Directory of the active config file, used to resolve a relative
+        # user_tests_dir without guessing the daemon's CWD.
+        self._config_dir = Path(config_dir).resolve() if config_dir else None
 
     # -- Workspace I/O ---------------------------------------------------
 
@@ -292,11 +298,57 @@ class PhaseManager:
         if reply.ok and not build_ok:
             self.state.record_error(f"build: {note}")
             self.state.save()
+            return replace_result(result, build_ok=False, summary=summary)
+        # Persist the fence-stripped source (agents wrap code in ```python
+        # fences) so the on-disk file is valid Python for the lint gate and the
+        # test phase's import, rather than the raw fenced blob.
+        if build_ok:
+            self.write_file(CODE_FILE, strip_code_fences(reply.text))
+        # Style/compile gate so obviously-broken or malformed output never
+        # reaches the "done" state even when it parses.
+        lint_ok, lint_note = self._lint_generated(CODE_FILE)
+        if not lint_ok:
+            self.state.record_error(f"build: {lint_note}")
+            self.state.save()
+            return replace_result(result, build_ok=False, summary=lint_note)
         return replace_result(
             result,
             build_ok=build_ok,
             summary=summary,
         )
+
+    def _lint_generated(self, relative_path: str) -> tuple[bool, str]:
+        """Compile/lint generated code before it is accepted.
+
+        ``py_compile`` catches latent syntax/indent errors ``ast.parse`` can
+        miss; ``flake8`` adds style checks. Returns (ok, note).
+        """
+        mode = self.config.execution.lint_generated
+        if mode == "off":
+            return True, ""
+        path = self.resolve_in_workspace(relative_path)
+        if mode == "py_compile":
+            try:
+                subprocess.run(  # nosec B603 - fixed argv, no shell
+                    [sys.executable, "-m", "py_compile", str(path)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                return False, f"generated code failed py_compile: {exc.stderr[:200]}"
+            return True, ""
+        # Only the flake8 path remains: off/py_compile already returned above,
+        # and build_config guarantees the mode is one of off|py_compile|flake8.
+        proc = subprocess.run(  # nosec B603 - fixed argv, no shell
+            [sys.executable, "-m", "flake8", "--max-line-length=100", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return False, f"generated code failed flake8: {proc.stdout[:200]}"
+        return True, ""
 
     def _verify_syntax(self, reply: AgentReply) -> tuple[bool, str]:
         """``build_ok`` must mean *the code parses*, not *the LLM answered*.
@@ -330,8 +382,18 @@ class PhaseManager:
             return replace_result(result, tests_passed=0, tests_total=0)
 
         passed, failed, note = await self._execute_generated_tests()
+        # Generated suite is clean and its own tests pass -> also verify against
+        # the user-owned suite if one is configured (real correctness signal).
+        user_passed = user_failed = 0
+        if failed == 0 and note == "":
+            user_passed, user_failed, user_note = await self._run_user_tests()
+            if user_note:
+                note = user_note
+                failed += user_failed
         total = passed + failed
         summary = f"Tests: {passed} passed, {failed} failed"
+        if user_passed or user_failed:
+            summary += f" (user suite: {user_passed} passed, {user_failed} failed)"
         if note:
             summary = f"{summary} ({note})"
             self.state.record_error(f"test: {note}")
@@ -345,14 +407,60 @@ class PhaseManager:
         )
 
     async def _execute_generated_tests(self) -> tuple[int, int, str]:
-        """Run the generated suite in an isolated subprocess.
+        """Run the generated suite, refusing/sandboxing untrusted code.
 
-        Hardened against LLM-authored code: fixed argv (never ``shell=True``),
-        ``-I`` isolated mode, no cache writes, and a hard timeout so one
-        ``while True:`` cannot wedge a 24/7 daemon forever.
+        Hardened against LLM-authored code in three layers:
+          * static scan — if the suite calls ``os.system``/``subprocess``/
+            network/socket/eval etc., we refuse to run it *at all* (the cost
+            of one destructive line far outweighs any signal it could give);
+          * adequacy gate — a suite of a single ``assert True`` is rejected so
+            the build cannot go green on a test written to pass;
+          * execution — if it passes both gates it runs in a fixed-argv
+            subprocess under OS resource limits so a runaway loop or memory
+            hog is killed instead of wedging the daemon.
         """
         tests_dir = self.workspace / "tests"
-        timeout = self.config.execution.test_timeout_seconds
+        test_src = ""
+        try:
+            test_src = (tests_dir / "test_generated.py").read_text(encoding="utf-8")
+        except OSError:
+            return 0, 1, "test file missing"
+
+        dangerous = scan_for_dangerous_calls(test_src)
+        if dangerous:
+            logger.error("Refusing to run generated suite: %s", "; ".join(dangerous))
+            return 0, 1, f"dangerous call in suite refused: {dangerous[0]}"
+
+        report = evaluate_suite(
+            test_src,
+            min_assertions_per_100_lines=self.config.execution.min_test_assertions_per_100_lines,
+        )
+        if not report.ok:
+            logger.error("Generated test suite inadequate: %s", report.reason)
+            return 0, 1, f"test suite inadequate: {report.reason}"
+
+        return await self._run_pytest(tests_dir)
+
+    async def _run_user_tests(self) -> tuple[int, int, str]:
+        """Run the user-owned suite (if configured) against the generated code.
+
+        The AI cannot see or edit these tests, so passing them is real evidence
+        the generated code works — this closes the self-test overfitting hole.
+        """
+        user_dir = self.config.execution.user_tests_dir
+        if not user_dir:
+            return 0, 0, ""
+        user_path = Path(user_dir)
+        if not user_path.is_absolute():
+            user_path = (self._config_dir / user_path) if self._config_dir else user_path
+        if not user_path.exists():
+            logger.warning("user_tests_dir %s does not exist; skipping", user_path)
+            return 0, 0, ""
+        return await self._run_pytest(user_path)
+
+    async def _run_pytest(self, tests_dir: Path) -> tuple[int, int, str]:
+        """Launch pytest for ``tests_dir`` with sandboxing where available."""
+        exec_cfg = self.config.execution
         argv = [
             sys.executable,
             "-I",
@@ -365,18 +473,30 @@ class PhaseManager:
             "no:cacheprovider",
             "--no-header",
         ]
+        timeout = exec_cfg.test_timeout_seconds
         try:
-            proc = await asyncio.to_thread(
-                subprocess.run,  # nosec B603 - fixed argv, no shell
-                argv,
-                capture_output=True,
-                text=True,
-                cwd=str(self.workspace),
-                timeout=timeout,
-                check=False,
-            )
+            if exec_cfg.sandbox_tests:
+                proc = await asyncio.to_thread(
+                    run_sandboxed,  # nosec B603 - fixed argv, no shell
+                    argv,
+                    cwd=str(self.workspace),
+                    timeout=timeout,
+                    cpu_seconds=exec_cfg.sandbox_cpu_seconds,
+                    wall_seconds=exec_cfg.sandbox_wall_seconds,
+                    rss_bytes=exec_cfg.sandbox_rss_bytes,
+                )
+            else:
+                proc = await asyncio.to_thread(
+                    subprocess.run,  # nosec B603 - fixed argv, no shell
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(self.workspace),
+                    timeout=timeout,
+                    check=False,
+                )
         except subprocess.TimeoutExpired:
-            logger.error("Generated test suite timed out after %ss", timeout)
+            logger.error("Test suite timed out after %ss", timeout)
             return 0, 1, f"timed out after {timeout}s"
         except OSError as exc:
             logger.exception("Could not spawn the test subprocess")
@@ -384,7 +504,6 @@ class PhaseManager:
 
         passed, failed = parse_test_summary(proc.stdout, proc.stderr)
         if passed == 0 and failed == 0 and proc.returncode != 0:
-            # Non-zero exit with no parsable summary == collection error.
             return 0, 1, f"pytest exited {proc.returncode} with no test summary"
         return passed, failed, ""
 

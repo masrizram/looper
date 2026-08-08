@@ -89,6 +89,55 @@ outage never reads as "no issues found".
 
 ---
 
+## Built-in safeguards
+
+Looper executes code written by a language model, so it is hardened against
+the failure modes of autonomous agents by design:
+
+- **Cost ceiling (`max_cost_usd`).** Each build tracks estimated API spend
+  (token usage × per-model price). Crossing the ceiling aborts the build
+  *hard* and exits `4` — no silent bill runaway (ADR-005).
+- **Untrusted-code sandbox (`sandbox_tests`).** Generated test suites run in a
+  fixed-argv subprocess under OS resource limits (CPU/wall/RSS). A static scan
+  *refuses to run* any suite that shells out, spawns processes, touches the
+  network, or uses `eval`/`exec` — so dangerous LLM output is never executed
+  on the host (ADR-006).
+- **Anti-overfitting (`user_tests_dir` + `min_test_assertions_per_100_lines`).**
+  Because the AI writes both the code *and* its tests, a weak suite cannot
+  green-light a build: the suite must clear an assertion-density floor, must
+  not hardcode the expected score, and — if you supply `user_tests_dir` — the
+  generated code must also pass *your* tests, which the AI never sees (ADR-06).
+- **Lint gate (`lint_generated`).** Generated code is `py_compile`/`flake8`
+  checked before it is accepted, so output that does not even compile never
+  reaches the "done" state.
+- **Scope guard.** Every agent prompt injects a strict "stay within the goal,
+  do not shell out, do not hallucinate changes to pass tests" directive, so a
+  long loop cannot drift off the original task (ADR-007).
+- **Loop cap (`max_cycles`).** A build always stops after N cycles; a human
+  evaluates anything still failing (ADR-001).
+
+### Safeguard configuration
+
+All safeguards are configured under the `execution` key in `config.yaml`:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `max_cost_usd` | `0.0` (off) | Hard USD ceiling per build; `0` disables the abort (ADR-005). |
+| `model_prices_usd_per_1k` | `{}` | Per-model price overrides; falls back to `default_token_price_usd`. |
+| `default_token_price_usd` | `0.002` | Used when a model has no explicit price. |
+| `sandbox_tests` | `true` | Run generated suites in the resource-limited subprocess. |
+| `sandbox_cpu_seconds` | `60` | POSIX CPU-time rlimit for one test run. |
+| `sandbox_wall_seconds` | `300` | POSIX wall-time rlimit (Windows: covered by the pytest `timeout`). |
+| `sandbox_rss_bytes` | `1_000_000_000` | POSIX address-space rlimit. |
+| `min_test_assertions_per_100_lines` | `6` | Assertion-density floor; `0` disables it. |
+| `user_tests_dir` | `""` (off) | Dir of human-owned tests the AI cannot see/edit. |
+| `lint_generated` | `"py_compile"` | `off` \| `py_compile` \| `flake8` gate on generated code. |
+
+The design rationale for each safeguard is recorded in `docs/adr/`:
+ADR-005 (cost budget), ADR-006 (sandbox + anti-overfit), ADR-007 (scope guard).
+
+---
+
 ## Triggering builds
 
 **File watcher** — write a goal into `looper_commands.txt`:
@@ -159,7 +208,7 @@ python -m looper.cli --check-config
 | `--json-logs` | Structured JSON logs for log shippers |
 | `--log-level` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
-Exit codes: `0` ok · `2` config error · `3` build below minimum · `130` interrupted.
+Exit codes: `0` ok · `2` config error · `3` build below minimum · `4` cost budget exceeded · `130` interrupted.
 
 ---
 
