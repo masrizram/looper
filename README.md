@@ -31,7 +31,8 @@ looper --goal "build a URL shortener"      # exit 3 if it does not clear the gat
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
-export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-...   # bash / Linux / macOS
+# Windows (PowerShell):  $env:OPENROUTER_API_KEY="sk-or-..."
 
 looper --check-config                 # validate config.yaml
 looper --check-models                 # every model slug really exists
