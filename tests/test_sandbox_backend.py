@@ -18,6 +18,7 @@ from looper.sandbox import (
     SandboxUnavailableError,
     docker_argv,
     docker_available,
+    podman_available,
     posix_rlimits_available,
     resolve_backend,
     run_sandboxed,
@@ -175,7 +176,7 @@ def test_every_declared_backend_is_handled():
             result = resolve_backend(backend, fail_closed=False, runner=_runner(0))
         except SandboxUnavailableError:  # pragma: no cover - fail_closed is off
             pytest.fail(f"{backend} raised despite fail_closed=False")
-        assert result in ("docker", "rlimit", "none")
+        assert result in ("docker", "podman", "rlimit", "none")
 
 
 # -- container argv ------------------------------------------------------
@@ -278,3 +279,120 @@ def test_run_sandboxed_really_executes_a_process(tmp_path):
     )
     assert proc.returncode == 0
     assert "hello from sandbox" in proc.stdout
+
+
+# -- podman backend (drop-in container runtime) ---------------------------
+
+
+def test_podman_available_true_when_info_answers():
+    # Podman is probed with `podman info` (not `version`): `version` exits 0
+    # even with no machine running, which would falsely claim isolation.
+    run = _runner(0)
+    assert podman_available(run) is True
+    assert run.calls[0][:2] == ["podman", "info"]
+
+
+def test_podman_available_false_on_nonzero_exit():
+    assert podman_available(_runner(1)) is False
+
+
+def test_podman_available_false_when_binary_missing():
+    assert podman_available(_runner(raises=FileNotFoundError("no podman"))) is False
+
+
+def test_podman_available_false_on_timeout():
+    exc = subprocess.TimeoutExpired(cmd="podman", timeout=15)
+    assert podman_available(_runner(raises=exc)) is False
+
+
+def test_resolve_podman_explicit_succeeds():
+    assert resolve_backend("podman", runner=_runner(0)) == "podman"
+
+
+def test_resolve_podman_explicit_fails_closed_without_machine():
+    with pytest.raises(SandboxUnavailableError) as err:
+        resolve_backend("podman", runner=_runner(1))
+    assert "no running Podman machine" in str(err.value)
+
+
+def test_resolve_podman_degrades_when_not_fail_closed(caplog):
+    with caplog.at_level("WARNING"):
+        assert resolve_backend("podman", fail_closed=False, runner=_runner(1)) == "none"
+    assert "WITHOUT isolation" in caplog.text
+
+
+def test_resolve_auto_prefers_docker_over_podman():
+    # A fake runner that answers "yes" for both must resolve to docker first.
+    calls: list[list[str]] = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="", stderr="", args=argv)
+
+    assert resolve_backend("auto", runner=run) == "docker"
+    # First probe is the docker server version; podman info is never reached.
+    assert calls[0][:2] == ["docker", "version"]
+    assert not any("podman" in c for c in calls)
+
+
+def test_resolve_auto_falls_back_to_podman_without_docker(fake_rlimits):
+    # Docker down (nonzero) but podman up (zero). Needs rlimit off so the
+    # fallback chain reaches the container runtimes.
+    fake_rlimits(False)
+
+    def run(argv, **kwargs):
+        # docker -> nonzero, podman -> zero
+        if argv[:1] == ["docker"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="", args=argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="", args=argv)
+
+    assert resolve_backend("auto", runner=run) == "podman"
+
+
+def test_resolve_auto_refuses_when_neither_container_runtime(fake_rlimits):
+    fake_rlimits(False)
+    with pytest.raises(SandboxUnavailableError) as err:
+        resolve_backend("auto", runner=_runner(1))
+    assert "no Docker/Podman daemon" in str(err.value)
+
+
+def test_podman_argv_is_locked_down():
+    argv = docker_argv(
+        ["/usr/bin/python", "-m", "pytest", "tests"],
+        cwd="/work/space",
+        image="python:3.11-slim",
+        network="none",
+        cpu_seconds=120,
+        rss_bytes=512_000_000,
+        runtime="podman",
+    )
+    # The ONLY difference from docker is the leading binary; every safety flag
+    # is identical, so rootless podman gives the same blast-radius guarantees.
+    assert argv[0] == "podman"
+    assert "run" in argv
+    assert "--network=none" in argv
+    assert "--read-only" in argv
+    assert "--security-opt=no-new-privileges" in argv
+    assert "--pids-limit=256" in argv
+    assert "-v" in argv and "/work/space:/work" in argv
+    assert "/usr/bin/python" not in argv
+    assert argv[argv.index("python:3.11-slim") + 1] == "python"
+    assert argv[-3:] == ["-m", "pytest", "tests"]
+
+
+def test_run_sandboxed_uses_podman_when_selected():
+    run = _runner(0)
+    run_sandboxed(
+        ["python", "-m", "pytest"],
+        cwd="/w",
+        timeout=30,
+        cpu_seconds=60,
+        wall_seconds=60,
+        rss_bytes=64_000_000,
+        backend="podman",
+        runner=run,
+    )
+    # First call probes podman info, second is the containerised run.
+    assert run.calls[0][:2] == ["podman", "info"]
+    assert run.calls[1][0] == "podman"
+    assert "run" in run.calls[1]

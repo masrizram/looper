@@ -106,6 +106,16 @@ def test_doctor_ok_when_docker_present(config, monkeypatch, caplog):
     assert "effective sandbox" in caplog.text
 
 
+def test_doctor_reports_podman_when_only_podman_available(config, monkeypatch, caplog):
+    monkeypatch.setattr("looper.cli.docker_available", lambda: False)
+    monkeypatch.setattr("looper.cli.podman_available", lambda: True)
+    monkeypatch.setattr("looper.cli.resolve_backend", lambda *a, **k: "podman")
+    with caplog.at_level("INFO"):
+        assert run_doctor(config) == EXIT_OK
+    assert "podman machine      : yes" in caplog.text
+    assert "effective sandbox   : podman" in caplog.text
+
+
 def test_doctor_warns_when_effective_backend_is_none(config, monkeypatch, caplog):
     monkeypatch.setattr("looper.cli.docker_available", lambda: False)
     monkeypatch.setattr("looper.cli.resolve_backend", lambda *a, **k: "none")

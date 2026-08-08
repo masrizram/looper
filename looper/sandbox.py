@@ -115,10 +115,14 @@ class SandboxUnavailableError(RuntimeError):
 
 
 #: Accepted values for ``execution.sandbox_backend``.
-SANDBOX_BACKENDS: tuple[str, ...] = ("auto", "rlimit", "docker", "none")
+SANDBOX_BACKENDS: tuple[str, ...] = ("auto", "rlimit", "docker", "podman", "none")
 
 #: Effective backends ``resolve_backend`` may return.
-EFFECTIVE_BACKENDS: tuple[str, ...] = ("rlimit", "docker", "none")
+EFFECTIVE_BACKENDS: tuple[str, ...] = ("rlimit", "docker", "podman", "none")
+
+#: Container runtimes share one locked-down ``run`` contract (read-only,
+#: no network, cpu/memory/pids capped). Either binary satisfies it.
+CONTAINER_RUNTIMES: tuple[str, ...] = ("docker", "podman")
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -135,10 +139,34 @@ def docker_available(runner: Runner | None = None) -> bool:
     latter succeeds even when the daemon is down, which would let us claim
     container isolation we cannot actually provide.
     """
+    return _docker_probe("docker", runner)
+
+
+def podman_available(runner: Runner | None = None) -> bool:
+    """True when a running Podman machine (and the ``podman`` binary) exists.
+
+    Podman is a drop-in for Docker for the ``run`` call, but its ``version``
+    command exits 0 even when **no machine is running** -- the same fail-open
+    trap ADR-008 closed for ``docker --version``. So we probe ``podman info``
+    (which reaches the machine/VM) and treat anything that does not confirm a
+    live runtime as "not available" rather than "isolation ready".
+    """
+    return _docker_probe("podman", runner, info=True)
+
+
+def _docker_probe(binary: str, runner: Runner | None, *, info: bool = False) -> bool:
+    """Probe a Docker-compatible runtime for a *responsive* daemon/machine.
+
+    For Docker the canonical probe is ``<bin> version`` (server component).
+    For Podman we use ``<bin> info``, because ``podman version`` reports the
+    client version and exits 0 even with no machine booted. Either probe must
+    return a clean exit code, or we report no isolation.
+    """
     run = runner or subprocess.run
+    argv = [binary, "info"] if info else [binary, "version", "--format", "{{.Server.Version}}"]
     try:
         proc = run(  # nosec B603 B607 - fixed argv, no shell
-            ["docker", "version", "--format", "{{.Server.Version}}"],
+            argv,
             capture_output=True,
             text=True,
             timeout=15,
@@ -147,6 +175,22 @@ def docker_available(runner: Runner | None = None) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0
+
+
+def container_runtime_available(*, runner: Runner | None = None) -> str | None:
+    """First available Docker-compatible runtime, or ``None``.
+
+    Prefers Docker over Podman: the existing agents' ``sandbox_image`` default
+    and ``docker_argv`` wiring are Docker-shaped, and Podman's rootless setup
+    is a strict superset of what Docker needs. Returning the binary name lets
+    ``resolve_backend`` feed it straight into the shared ``docker_argv``.
+    """
+    for runtime in CONTAINER_RUNTIMES:
+        if runtime == "docker" and docker_available(runner):
+            return "docker"
+        if runtime == "podman" and podman_available(runner):
+            return "podman"
+    return None
 
 
 def resolve_backend(
@@ -172,10 +216,17 @@ def resolve_backend(
         )
         return "none"
 
-    if requested == "docker":
-        if docker_available(runner):
+    if requested in ("docker", "podman"):
+        if requested == "docker" and docker_available(runner):
             return "docker"
-        return _unavailable("docker backend requested but no Docker daemon responded", fail_closed)
+        if requested == "podman" and podman_available(runner):
+            return "podman"
+        message = (
+            "docker backend requested but no Docker daemon responded"
+            if requested == "docker"
+            else "podman backend requested but no running Podman machine was found"
+        )
+        return _unavailable(message, fail_closed)
 
     if requested == "rlimit":
         if posix_rlimits_available():
@@ -185,12 +236,13 @@ def resolve_backend(
         )
 
     # auto
-    if docker_available(runner):
-        return "docker"
+    runtime = container_runtime_available(runner=runner)
+    if runtime is not None:
+        return runtime
     if posix_rlimits_available():
         return "rlimit"
     return _unavailable(
-        "no sandbox backend available (no Docker daemon, no POSIX rlimits)", fail_closed
+        "no sandbox backend available (no Docker/Podman daemon, no POSIX rlimits)", fail_closed
     )
 
 
@@ -209,15 +261,18 @@ def docker_argv(
     network: str,
     cpu_seconds: int,
     rss_bytes: int,
+    runtime: str = "docker",
 ) -> list[str]:
     """Wrap ``argv`` so it runs inside a throwaway, network-isolated container.
 
     The host interpreter path in ``argv[0]`` is meaningless inside the image,
     so it is replaced with the container's ``python``. The workspace is the
     only thing mounted, which also contains the filesystem blast radius.
+    ``runtime`` is the resolved binary (``docker`` or ``podman``); both share
+    this exact ``run`` contract (read-only, no network, capped cpu/mem/pids).
     """
     return [
-        "docker",
+        runtime,
         "run",
         "--rm",
         f"--network={network}",
@@ -254,7 +309,11 @@ def run_sandboxed(
     """Run ``argv`` (fixed, never shell) under the strongest isolation available.
 
     * ``docker`` -- throwaway read-only container, no network, cpu/memory/pids
-      capped. Identical guarantees on Linux, macOS and Windows.
+      capped. Identical guarantees on Linux, macOS and Windows (needs a Docker
+      daemon / Desktop).
+    * ``podman`` -- same throwaway container contract via the ``podman`` binary
+      (needs a running Podman machine on Windows/macOS). The ``run`` flags are
+      shared with Docker; only the binary differs.
     * ``rlimit`` -- POSIX ``preexec_fn`` installing RLIMIT_CPU / RLIMIT_AS.
     * ``none``   -- no isolation; only reachable when the caller explicitly
       opted out or set ``fail_closed=False``.
@@ -265,7 +324,7 @@ def run_sandboxed(
     run = runner or subprocess.run
     effective = resolve_backend(backend, fail_closed=fail_closed, runner=runner)
 
-    if effective == "docker":
+    if effective in ("docker", "podman"):
         return run(  # nosec B603 - fixed argv, no shell
             docker_argv(
                 argv,
@@ -274,6 +333,7 @@ def run_sandboxed(
                 network=network,
                 cpu_seconds=cpu_seconds,
                 rss_bytes=rss_bytes,
+                runtime=effective,
             ),
             capture_output=True,
             text=True,

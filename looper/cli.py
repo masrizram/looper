@@ -18,6 +18,7 @@ from looper.orchestrator import LooperDaemon
 from looper.sandbox import (
     SandboxUnavailableError,
     docker_available,
+    podman_available,
     posix_rlimits_available,
     resolve_backend,
 )
@@ -168,12 +169,14 @@ def run_doctor(config: LooperConfig) -> int:
     """
     execution = config.execution
     docker = docker_available()
+    podman = podman_available()
     rlimits = posix_rlimits_available()
     git_ok = GitRepo(Path(config.workspace)).available()
 
     logger.info("looper %s doctor", __version__)
     logger.info("  platform            : %s", sys.platform)
     logger.info("  docker daemon       : %s", "yes" if docker else "no")
+    logger.info("  podman machine      : %s", "yes" if podman else "no")
     logger.info("  POSIX rlimits       : %s", "yes" if rlimits else "no")
     logger.info("  git binary          : %s", "yes" if git_ok else "no")
     logger.info("  sandbox_backend     : %s", execution.sandbox_backend)

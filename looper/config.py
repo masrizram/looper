@@ -291,8 +291,9 @@ class ExecutionConfig:
     sandbox_cpu_seconds: int = 60
     sandbox_wall_seconds: int = 300
     sandbox_rss_bytes: int = 1_000_000_000
-    #: Which isolation backend to use: auto|rlimit|docker|none. "auto" prefers
-    #: Docker (identical guarantees on every OS) then POSIX rlimits. ADR-008.
+    #: Which isolation backend to use: auto|rlimit|docker|podman|none.
+    #: "auto" prefers Docker (identical guarantees on every OS) then Podman
+    #: then POSIX rlimits. ADR-008.
     sandbox_backend: str = "auto"
     sandbox_image: str = "python:3.11-slim"
     #: Docker network mode for the sandbox container. "none" = no network.
