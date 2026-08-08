@@ -1,0 +1,85 @@
+# =============================================================================
+# Looper Daemon configuration
+# -----------------------------------------------------------------------------
+# File ini dibaca oleh daemon.py (default: config.yaml, fallback looper_config.yaml).
+# Kalau kamu punya file config lama bernama looper_config.yaml, daemon tetap
+# bisa memuatnya berkat fallback otomatis di load_config().
+#
+# Semua field bersifat opsional -- nilai yang tidak ditulis pakai default di kode.
+# Ganti "model" kapan saja tanpa perlu ubah daemon.py.
+# =============================================================================
+
+# Direktori kerja relatif terhadap CWD saat menjalankan daemon.
+workspace: "./workspace"
+state_file: "./looper_state.json"
+watch_file: "./looper_commands.txt"
+
+# --- HTTP API server ---------------------------------------------------------
+# Bind default 127.0.0.1 (hanya localhost) demi keamanan. Ganti ke 0.0.0.0
+# HANYA jika sudah di belakang reverse proxy ber-auth (mis. nginx + mTLS).
+# auth_token_env: nama environment variable yang menyimpan bearer token.
+#   Kalau kosong/tidak diset, server tetap jalan TAPI tanpa auth (warning di log).
+http:
+  bind: "127.0.0.1"
+  port: 9999
+  auth_token_env: "LOOPER_HTTP_TOKEN"
+
+execution:
+  max_cycles: 5
+  target_score: 99
+  min_acceptable: 95
+
+# --- Koneksi ke OpenRouter --------------------------------------------
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+  # HANYA nama environment variable, BUKAN API key itu sendiri.
+  # Export di shell:  export OPENROUTER_API_KEY=sk-or-...
+  api_key_env: "OPENROUTER_API_KEY"
+  site_url: ""            # opsional, buat ranking di openrouter.ai
+  site_name: "Looper Daemon"
+
+# --- Role -> model, sesuai tabel ROLE & MODEL ASSIGNMENT ---------------
+# Field opsional: model, role, temperature, max_tokens.
+# Model di bawah bisa di-upgrade kapan saja (mis. anthropic/claude-sonnet-4,
+# openai/gpt-5.1, google/gemini-2.5-pro, deepseek/deepseek-r1-0528) cukup
+# ganti string "model" di sini -- tidak perlu sentuh kode.
+agents:
+  researcher:
+    model: "deepseek/deepseek-r1"
+  architect:
+    model: "deepseek/deepseek-r1"
+  ux_api_designer:
+    model: "openai/gpt-4o"
+  builder:
+    model: "anthropic/claude-3.5-sonnet"
+  tester:
+    model: "deepseek/deepseek-r1"
+  reviewer:
+    model: "anthropic/claude-3.5-sonnet"
+  security_auditor:
+    model: "openai/gpt-4o"
+  performance_optimizer:
+    model: "anthropic/claude-3.5-sonnet"
+  documentation_writer:
+    model: "google/gemini-pro-1.5"
+  fixer:
+    model: "anthropic/claude-3.5-sonnet"
+
+# --- Phase yang dijalankan (opsional, override default di kode) --------
+# phases:        siklus pertama (pipeline lengkap)
+# retry_phases:  siklus ulang setelah fix (hanya re-validasi)
+# final_phases:  sekali jalan setelah gate skor terpenuhi
+# phases:
+#   - research
+#   - architecture
+#   - build
+#   - test
+#   - review
+#   - security_audit
+# retry_phases:
+#   - test
+#   - review
+#   - security_audit
+# final_phases:
+#   - performance_optimize
+#   - documentation

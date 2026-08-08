@@ -1,0 +1,5 @@
+# Looper Daemon runtime dependencies
+openai>=1.30
+aiohttp>=3.9
+pyyaml>=6.0
+pytest>=8.0
