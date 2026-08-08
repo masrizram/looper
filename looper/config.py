@@ -220,6 +220,9 @@ class ExecutionConfig:
     min_acceptable: float = 95.0
     test_timeout_seconds: int = 600
     max_history_entries: int = 500
+    #: Ceiling on any single file written from agent output. An LLM that
+    #: loops can otherwise fill the disk of an unattended 24/7 daemon.
+    max_file_bytes: int = 2_000_000
 
     def __post_init__(self) -> None:
         _require_int(self.max_cycles, "execution.max_cycles", 1, 1000)
@@ -227,6 +230,7 @@ class ExecutionConfig:
         _require_number(self.min_acceptable, "execution.min_acceptable", 0.0, 100.0)
         _require_int(self.test_timeout_seconds, "execution.test_timeout_seconds", 1, 86_400)
         _require_int(self.max_history_entries, "execution.max_history_entries", 1, 1_000_000)
+        _require_int(self.max_file_bytes, "execution.max_file_bytes", 1024, 1_000_000_000)
         if self.min_acceptable > self.target_score:
             raise ConfigError(
                 "execution.min_acceptable must be <= target_score, got "
@@ -241,10 +245,19 @@ class OpenRouterConfig:
     api_key: str = ""
     site_url: str = ""
     site_name: str = "Looper Daemon"
+    #: Hard ceiling on a single LLM call. Without it one stalled connection
+    #: wedges a phase, and therefore the whole 24/7 daemon, indefinitely.
+    request_timeout_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         if not self.base_url.startswith(("http://", "https://")):
             raise ConfigError(f"openrouter.base_url must be http(s), got {self.base_url!r}")
+        _require_number(
+            self.request_timeout_seconds,
+            "openrouter.request_timeout_seconds",
+            1.0,
+            3600.0,
+        )
 
     def default_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -346,6 +359,7 @@ def build_config(
         min_acceptable=exec_raw.get("min_acceptable", 95.0),
         test_timeout_seconds=exec_raw.get("test_timeout_seconds", 600),
         max_history_entries=exec_raw.get("max_history_entries", 500),
+        max_file_bytes=exec_raw.get("max_file_bytes", 2_000_000),
     )
 
     scoring_raw = section("scoring")
@@ -381,6 +395,7 @@ def build_config(
         api_key=_read_env(api_key_env, env),
         site_url=str(or_raw.get("site_url", "")),
         site_name=str(or_raw.get("site_name", "Looper Daemon")),
+        request_timeout_seconds=or_raw.get("request_timeout_seconds", 300.0),
     )
 
     agents_raw = section("agents")

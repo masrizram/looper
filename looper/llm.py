@@ -1,10 +1,11 @@
-"""OpenRouter LLM client: retries, backoff, and explicit failure signalling."""
+"""OpenRouter LLM client: timeouts, retries, backoff, and cost accounting."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 from looper.config import AgentSpec, OpenRouterConfig, RetryPolicy
 
@@ -14,9 +15,87 @@ logger = logging.getLogger("looper.llm")
 #: rather than pattern-matching this string.
 ERROR_PREFIX = "[ERROR"
 
+#: HTTP statuses that retrying cannot fix. A 401 stays a 401 no matter how
+#: long we wait, and burning the full retry budget on one only delays the
+#: operator's feedback while spending rate-limit headroom.
+NON_RETRYABLE_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
+
+#: Pulls a leading HTTP status out of SDK error text such as
+#: "Error code: 401 - Invalid API key". Used only when the exception carries
+#: no structured ``status_code``.
+_STATUS_IN_TEXT_RE = re.compile(r"\b(?:error code|status(?:_code)?)\D{0,3}(\d{3})\b", re.I)
+
 
 class LLMUnavailableError(RuntimeError):
     """Raised when the optional ``openai`` dependency is missing."""
+
+
+class NonRetryableError(RuntimeError):
+    """Wraps a provider error that retrying cannot possibly fix."""
+
+
+def status_code_of(exc: BaseException) -> int | None:
+    """Best-effort HTTP status extraction from an SDK exception."""
+    for attribute in ("status_code", "status", "http_status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    match = _STATUS_IN_TEXT_RE.search(str(exc))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """False for client errors that will fail identically on every attempt."""
+    status = status_code_of(exc)
+    if status is None:
+        return True  # unknown cause: assume transient (network blip, 5xx)
+    if status == 429:
+        return True  # rate limited: backing off is exactly the right move
+    return status not in NON_RETRYABLE_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """Token accounting for one call, when the provider reports it."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+def usage_of(response: object) -> TokenUsage:
+    """Read ``response.usage`` defensively; providers may omit it entirely."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return TokenUsage()
+    prompt = getattr(usage, "prompt_tokens", 0)
+    completion = getattr(usage, "completion_tokens", 0)
+    return TokenUsage(
+        prompt_tokens=prompt if isinstance(prompt, int) else 0,
+        completion_tokens=completion if isinstance(completion, int) else 0,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +111,8 @@ class AgentReply:
     ok: bool
     attempts: int
     error: str = ""
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    timed_out: bool = False
 
     @property
     def failed(self) -> bool:
@@ -39,7 +120,16 @@ class AgentReply:
 
 
 class OpenRouterClient:
-    """Thin async wrapper over the OpenAI SDK pointed at OpenRouter."""
+    """Thin async wrapper over the OpenAI SDK pointed at OpenRouter.
+
+    Adds three things the raw SDK does not give us:
+
+    * a **hard per-call timeout**, so one stalled connection cannot wedge a
+      24/7 daemon (the subprocess had a timeout; this call did not);
+    * **retry classification**, so a 401 fails fast instead of burning the
+      whole budget on an error that can never succeed;
+    * **token accounting**, so an unattended daemon reports what it spends.
+    """
 
     def __init__(
         self,
@@ -51,6 +141,8 @@ class OpenRouterClient:
     ) -> None:
         self.config = openrouter
         self.retry = retry
+        self.total_usage = TokenUsage()
+        self.call_count = 0
 
         if client is not None:
             self._client = client
@@ -89,7 +181,7 @@ class OpenRouterClient:
         *,
         extra_system: str = "",
     ) -> AgentReply:
-        """Call ``agent`` with ``prompt``, retrying transient failures."""
+        """Call ``agent`` with ``prompt``, retrying only transient failures."""
         system_prompt = (
             f"You are the {agent.role} on an autonomous multi-agent software "
             "engineering team. Stay strictly within this role's responsibilities."
@@ -98,27 +190,62 @@ class OpenRouterClient:
             system_prompt = f"{system_prompt} {extra_system}"
 
         last_error: BaseException | None = None
+        timed_out = False
+
         for attempt in range(1, self.retry.max_attempts + 1):
             try:
-                response = await self._client.chat.completions.create(  # type: ignore[attr-defined]
-                    model=agent.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=agent.max_tokens,
-                    temperature=agent.temperature,
+                response = await asyncio.wait_for(
+                    self._client.chat.completions.create(  # type: ignore[attr-defined]
+                        model=agent.model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=agent.max_tokens,
+                        temperature=agent.temperature,
+                    ),
+                    timeout=self.config.request_timeout_seconds,
+                )
+                usage = usage_of(response)
+                self.total_usage = self.total_usage + usage
+                self.call_count += 1
+                logger.info(
+                    "Agent %s ok in %d attempt(s); tokens=%d (run total=%d)",
+                    agent.role,
+                    attempt,
+                    usage.total_tokens,
+                    self.total_usage.total_tokens,
                 )
                 return AgentReply(
                     text=response.choices[0].message.content or "",
                     ok=True,
                     attempts=attempt,
+                    usage=usage,
                 )
             except asyncio.CancelledError:
                 # Must propagate: swallowing this makes the daemon unstoppable.
                 raise
-            except Exception as exc:  # noqa: BLE001 - retry, then surface
+            except asyncio.TimeoutError as exc:
+                timed_out = True
                 last_error = exc
+                logger.warning(
+                    "Agent %s attempt %d/%d timed out after %.0fs",
+                    agent.role,
+                    attempt,
+                    self.retry.max_attempts,
+                    self.config.request_timeout_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 - classify, retry, surface
+                timed_out = False
+                last_error = exc
+                if not is_retryable(exc):
+                    logger.error(
+                        "Agent %s failed with a non-retryable error (HTTP %s): %s",
+                        agent.role,
+                        status_code_of(exc),
+                        exc,
+                    )
+                    return self._failure(agent, exc, attempt, timed_out=False)
                 logger.warning(
                     "Agent %s attempt %d/%d failed: %s",
                     agent.role,
@@ -126,13 +253,25 @@ class OpenRouterClient:
                     self.retry.max_attempts,
                     exc,
                 )
-                if attempt < self.retry.max_attempts:
-                    await asyncio.sleep(self.retry.delay_for(attempt))
 
-        message = f"{ERROR_PREFIX} calling {agent.role} ({agent.model}): {last_error}]"
+            if attempt < self.retry.max_attempts:
+                await asyncio.sleep(self.retry.delay_for(attempt))
+
+        return self._failure(agent, last_error, self.retry.max_attempts, timed_out=timed_out)
+
+    def _failure(
+        self,
+        agent: AgentSpec,
+        error: BaseException | None,
+        attempts: int,
+        *,
+        timed_out: bool,
+    ) -> AgentReply:
+        message = f"{ERROR_PREFIX} calling {agent.role} ({agent.model}): {error}]"
         return AgentReply(
             text=message,
             ok=False,
-            attempts=self.retry.max_attempts,
-            error=str(last_error),
+            attempts=attempts,
+            error=str(error),
+            timed_out=timed_out,
         )

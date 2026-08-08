@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from looper.config import build_config
 from looper.phases import (
     CODE_FILE,
     DESIGN_FILE,
@@ -391,3 +392,31 @@ def test_evidence_absorbs_fix_as_build_signal():
 def test_workspace_is_created_on_init(config):
     phases = build_phases(config)
     assert phases.workspace.exists()
+
+
+# --- File size cap -----------------------------------------------------------
+
+
+def test_oversized_agent_output_is_truncated(raw_config):
+    """An LLM stuck in a loop must not fill the disk of a 24/7 daemon."""
+    config = build_config({**raw_config, "execution": {"max_file_bytes": 2048}}, env={})
+    phases = build_phases(config)
+    phases.write_file("big.py", "x" * 10_000)
+    written = phases.read_file("big.py")
+    assert len(written.encode("utf-8")) < 10_000
+    assert "TRUNCATED by looper" in written
+
+
+def test_output_within_the_cap_is_untouched(raw_config):
+    config = build_config({**raw_config, "execution": {"max_file_bytes": 4096}}, env={})
+    phases = build_phases(config)
+    phases.write_file("small.py", "print('ok')")
+    assert phases.read_file("small.py") == "print('ok')"
+
+
+def test_truncation_does_not_split_a_utf8_character(raw_config):
+    """Slicing bytes mid-codepoint would raise; errors='ignore' prevents it."""
+    config = build_config({**raw_config, "execution": {"max_file_bytes": 1025}}, env={})
+    phases = build_phases(config)
+    phases.write_file("uni.md", "\u00e9" * 2000)  # 2 bytes each
+    assert "TRUNCATED by looper" in phases.read_file("uni.md")

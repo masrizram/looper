@@ -135,7 +135,24 @@ class PhaseManager:
         return candidate
 
     def write_file(self, relative_path: str, content: str) -> str:
+        """Write agent output into the workspace, size-capped.
+
+        Content is truncated rather than rejected: a partial artifact is more
+        useful to the next phase than none, and the marker makes the
+        truncation obvious to both the reviewer agent and a human.
+        """
         path = self.resolve_in_workspace(relative_path)
+        limit = self.config.execution.max_file_bytes
+        encoded = content.encode("utf-8")
+        if len(encoded) > limit:
+            logger.warning(
+                "Agent output for %s is %d bytes, over the %d byte cap; truncating",
+                relative_path,
+                len(encoded),
+                limit,
+            )
+            content = encoded[:limit].decode("utf-8", errors="ignore")
+            content += f"\n\n# [TRUNCATED by looper at {limit} bytes]\n"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         self.state.record_files([str(path)])

@@ -43,6 +43,9 @@ execution:
   test_timeout_seconds: 600
   # Batas entri history/errors di state -- cegah file state tumbuh tanpa henti.
   max_history_entries: 500
+  # Batas byte per file yang ditulis dari output agent. LLM yang ngeloop
+  # bisa memenuhi disk daemon 24/7; kelebihannya dipotong + ditandai.
+  max_file_bytes: 2000000
 
 # --- Kebijakan retry panggilan LLM -------------------------------------------
 retry:
@@ -77,6 +80,9 @@ openrouter:
   api_key_env: "OPENROUTER_API_KEY"
   site_url: ""            # opsional, untuk ranking di openrouter.ai
   site_name: "Looper Daemon"
+  # Hard timeout satu panggilan LLM (detik). Tanpa ini satu koneksi macet
+  # menggantung phase -- dan seluruh daemon -- tanpa batas.
+  request_timeout_seconds: 300
 
 # --- Role -> model -----------------------------------------------------------
 # Field opsional per agent: model, role, temperature, max_tokens.

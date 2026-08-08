@@ -60,6 +60,9 @@ class LooperDaemon:
         # History can be long; /status returns a bounded tail.
         snapshot["history"] = snapshot.get("history", [])[-20:]
         snapshot["build_in_progress"] = self._build_lock.locked()
+        # Cost observability: an unattended daemon must report what it spends.
+        snapshot["token_usage"] = self.client.total_usage.as_dict()
+        snapshot["llm_calls"] = self.client.call_count
         return snapshot
 
     # -- Lifecycle -------------------------------------------------------
@@ -165,7 +168,12 @@ class LooperDaemon:
                 execution.min_acceptable,
             )
 
-        self.state.update(status="done", current_phase="done", score=score)
+        self.state.update(
+            status="done",
+            current_phase="done",
+            score=score,
+            token_usage=self.client.total_usage.as_dict(),
+        )
         self.state.save()
         logger.info("Build complete. Final score: %.2f", score)
         return score
