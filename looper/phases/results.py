@@ -38,6 +38,11 @@ class PhaseResult:
     review_score: float = 0.0
     security_issues: tuple[str, ...] = ()
     error: str = ""
+    #: True when the agent failed because the provider returned 402 (account
+    #: out of credits). Lets the orchestrator abort the whole build instead of
+    #: grinding through the remaining agents/cycles on a condition that cannot
+    #: resolve on its own.
+    out_of_credits: bool = False
 
     @property
     def status(self) -> str:
@@ -57,6 +62,7 @@ class PhaseResult:
             "review_score": self.review_score,
             "security_issues": list(self.security_issues),
             "error": self.error,
+            "out_of_credits": self.out_of_credits,
         }
 
 

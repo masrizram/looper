@@ -13,6 +13,7 @@ from typing import Any, Sequence
 
 from looper import __version__
 from looper.config import ConfigError, CostBudgetExceeded, LooperConfig, load_config_with_dir
+from looper.llm import OutOfCreditsError
 from looper.models import CatalogueUnavailableError, check_models, fetch_catalogue
 from looper.orchestrator import LooperDaemon
 from looper.sandbox import (
@@ -31,6 +32,7 @@ EXIT_CONFIG_ERROR = 2
 EXIT_BUILD_BELOW_MINIMUM = 3
 EXIT_COST_EXCEEDED = 4
 EXIT_SANDBOX_UNAVAILABLE = 5
+EXIT_OUT_OF_CREDITS = 6
 EXIT_INTERRUPTED = 130
 
 
@@ -248,6 +250,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CostBudgetExceeded as exc:
         logger.error("Build aborted: %s", exc)
         return EXIT_COST_EXCEEDED
+    except OutOfCreditsError as exc:
+        logger.error("Build aborted: %s", exc)
+        return EXIT_OUT_OF_CREDITS
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         logger.info("Interrupted.")
         return EXIT_INTERRUPTED

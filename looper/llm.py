@@ -19,7 +19,13 @@ ERROR_PREFIX = "[ERROR"
 #: HTTP statuses that retrying cannot fix. A 401 stays a 401 no matter how
 #: long we wait, and burning the full retry budget on one only delays the
 #: operator's feedback while spending rate-limit headroom.
-NON_RETRYABLE_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
+NON_RETRYABLE_STATUSES = frozenset({400, 401, 402, 403, 404, 405, 422})
+
+#: HTTP statuses that mean the account itself cannot pay for the call. A 402
+#: is *not* transient: waiting will not conjure credits. We must surface it
+#: loudly (and let the orchestrator abort) rather than burning all retries
+#: on a condition that can never change mid-build.
+OUT_OF_CREDITS_STATUSES = frozenset({402})
 
 #: Pulls a leading HTTP status out of SDK error text such as
 #: "Error code: 401 - Invalid API key". Used only when the exception carries
@@ -33,6 +39,17 @@ class LLMUnavailableError(RuntimeError):
 
 class NonRetryableError(RuntimeError):
     """Wraps a provider error that retrying cannot possibly fix."""
+
+
+class OutOfCreditsError(NonRetryableError):
+    """OpenRouter returned 402 Payment Required for every attempt.
+
+    The account cannot pay for the call, so retrying is pointless and the
+    whole build must stop with a clear message rather than grinding through
+    every remaining agent and cycle. Distinct from a generic non-retryable
+    error so the orchestrator can abort fast and the CLI can exit with a
+    dedicated code.
+    """
 
 
 def status_code_of(exc: BaseException) -> int | None:
@@ -118,6 +135,10 @@ class AgentReply:
     error: str = ""
     usage: TokenUsage = field(default_factory=TokenUsage)
     timed_out: bool = False
+    #: True when the provider returned 402 Payment Required (account has no
+    #: credits). Carried explicitly so the orchestrator can abort the whole
+    #: build instead of treating it as an ordinary per-agent failure.
+    out_of_credits: bool = False
 
     @property
     def failed(self) -> bool:
@@ -260,11 +281,23 @@ class OpenRouterClient:
             except Exception as exc:  # noqa: BLE001 - classify, retry, surface
                 timed_out = False
                 last_error = exc
+                status = status_code_of(exc)
+                if status in OUT_OF_CREDITS_STATUSES:
+                    # The account cannot pay. Retrying cannot change this, and
+                    # burning the remaining attempts only delays the operator's
+                    # feedback. Fail fast so the build can stop early.
+                    logger.error(
+                        "Agent %s failed: OpenRouter returned 402 Payment Required "
+                        "- the account has no credits. Add credits at "
+                        "https://openrouter.ai/settings/credits (HTTP 402).",
+                        agent.role,
+                    )
+                    return self._failure(agent, exc, attempt, timed_out=False, out_of_credits=True)
                 if not is_retryable(exc):
                     logger.error(
                         "Agent %s failed with a non-retryable error (HTTP %s): %s",
                         agent.role,
-                        status_code_of(exc),
+                        status,
                         exc,
                     )
                     return self._failure(agent, exc, attempt, timed_out=False)
@@ -288,6 +321,7 @@ class OpenRouterClient:
         attempts: int,
         *,
         timed_out: bool,
+        out_of_credits: bool = False,
     ) -> AgentReply:
         message = f"{ERROR_PREFIX} calling {agent.role} ({agent.model}): {error}]"
         return AgentReply(
@@ -296,6 +330,7 @@ class OpenRouterClient:
             attempts=attempts,
             error=str(error),
             timed_out=timed_out,
+            out_of_credits=out_of_credits,
         )
 
     def model_price_per_1k(self, model: str) -> float:

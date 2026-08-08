@@ -273,6 +273,28 @@ def test_client_errors_are_not_retried(status):
     assert len(client._client.completions.calls) == 1
 
 
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 422, 402])
+def test_non_retryable_statuses_are_in_the_non_retryable_set(status):
+    """All these statuses are treated as non-retryable by ``is_retryable``."""
+    assert is_retryable(StatusError(status)) is False
+
+
+def test_402_is_reported_as_out_of_credits_and_not_retried():
+    """A 402 means the account cannot pay: fail fast with a clear signal."""
+    client = make(fail_with=StatusError(402))
+    reply = asyncio.run(client.call(AGENT, "p"))
+    assert reply.ok is False
+    assert reply.out_of_credits is True
+    assert reply.attempts == 1
+    assert len(client._client.completions.calls) == 1
+
+
+def test_402_logs_credits_message(caplog):
+    client = make(fail_with=StatusError(402))
+    asyncio.run(client.call(AGENT, "p"))
+    assert "402 Payment Required" in caplog.text
+
+
 @pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
 def test_transient_errors_are_retried(status):
     client = make(fail_with=StatusError(status))

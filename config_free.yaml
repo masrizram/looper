@@ -1,0 +1,67 @@
+# =============================================================================
+# Looper - konfigurasi FREE untuk smoke-test pipeline TANPA bayar.
+# -----------------------------------------------------------------------------
+# Semua agent pakai model ber-akhiran ":free" (tidak memotong kredit OpenRouter).
+# Slug sudah diverifikasi ada di katalog live via `looper --check-models`.
+#
+# CATATAN: model free (9B-31B) jarang sanggup tembus gate tinggi seperti 99.
+# Makanya target_score/min_acceptable diturunkan -> pipeline tetap jalan end-to-end
+# sebagai bukti alur, bukan untuk hasil produksi.
+#
+# Jalankan:
+#   $env:OPENROUTER_API_KEY="sk-or-..."   # key tetap wajib untuk auth (free tdk byr)
+#   looper --config config_free.yaml --goal "build a CLI calculator"
+# =============================================================================
+
+workspace: "./workspace"
+state_file: "./looper_state.json"
+watch_file: "./looper_commands.txt"
+
+execution:
+  max_cycles: 2
+  target_score: 50
+  min_acceptable: 1
+  test_timeout_seconds: 600
+  max_history_entries: 500
+  max_file_bytes: 2000000
+  max_cost_usd: 0.0               # free: tidak ada plafon biaya
+  default_token_price_usd: 0.0     # free: harga 0
+  user_tests_dir: ""
+  min_test_assertions_per_100_lines: 0   # free model lemah di test; nonaktifkan lantai
+  sandbox_tests: true
+  sandbox_cpu_seconds: 60
+  sandbox_wall_seconds: 300
+  sandbox_rss_bytes: 1000000000
+  sandbox_backend: "auto"
+  sandbox_image: "python:3.11-slim"
+  sandbox_network: "none"
+  sandbox_fail_closed: true
+  artifact_mode: "single_file"
+  max_files_per_build: 25
+  git:
+    enabled: false
+  lint_generated: "py_compile"
+
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+  api_key_env: "OPENROUTER_API_KEY"
+  site_url: ""
+  site_name: "Looper Daemon (free)"
+  request_timeout_seconds: 300
+
+# --- Tiering model FREE (hindari silent fallback; eksplisit di config) ------
+# Builder  = cohere/north-mini-code    (code specialist)
+# Tester   = openai/gpt-oss-20b        (KELUARGA BERBEDA dari builder - ADR-006)
+# Reviewer = google/gemma-4-31b-it     (KELUARGA BERBEDA dari builder - ADR-006)
+# Sisanya  = gpt-oss / gemma / nemotron (free, cukup untuk prose & reasoning)
+agents:
+  researcher:        { model: "google/gemma-4-31b-it:free",  role: "Senior Technical Researcher", temperature: 0.3 }
+  architect:         { model: "openai/gpt-oss-20b:free",      role: "System Architect",           temperature: 0.3 }
+  ux_api_designer:   { model: "google/gemma-4-31b-it:free",  role: "UX/API Designer",            temperature: 0.4 }
+  builder:           { model: "cohere/north-mini-code:free",   role: "Code Builder",               temperature: 0.2 }
+  tester:            { model: "openai/gpt-oss-20b:free",      role: "Test Generator",             temperature: 0.3 }
+  reviewer:          { model: "google/gemma-4-31b-it:free",  role: "Senior Reviewer",             temperature: 0.2 }
+  security_auditor:  { model: "openai/gpt-oss-20b:free",      role: "Security Auditor",           temperature: 0.2 }
+  performance_optimizer: { model: "openai/gpt-oss-20b:free",  role: "Performance Optimizer",      temperature: 0.2 }
+  documentation_writer:  { model: "google/gemma-4-31b-it:free", role: "Documentation Writer",      temperature: 0.4 }
+  fixer:             { model: "cohere/north-mini-code:free",   role: "Expert Fixer",               temperature: 0.2 }

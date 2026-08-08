@@ -88,6 +88,32 @@ def test_agent_outage_cannot_produce_a_passing_score(daemon_factory, good_run):
     assert score <= 50.0
 
 
+class StatusError(RuntimeError):
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message or f"Error code: {status}")
+        self.status_code = status
+
+
+def test_out_of_credits_aborts_build_early(raw_config, daemon_factory, caplog):
+    """A 402 must stop the build at the first failing phase, not grind on."""
+    import logging
+
+    config = cfg_from(raw_config, execution={"max_cycles": 5})
+    daemon = daemon_factory(cfg=config, fail_with=StatusError(402))
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(daemon.build("goal"))
+    # The dedicated error type must surface so the CLI can exit with code 6.
+    from looper.llm import OutOfCreditsError
+
+    assert isinstance(exc_info.value, OutOfCreditsError)
+    assert daemon.state.state["status"] == "out_of_credits"
+    # Only the first cycle's research phase should have run before abort.
+    phases = [entry["phase"] for entry in daemon.state.state["history"]]
+    assert phases[0] == "research"
+    assert "OUT OF CREDITS" in caplog.text
+    assert logging.ERROR in [r.levelno for r in caplog.records]
+
+
 def test_critical_finding_blocks_the_release_band(raw_config, daemon_factory, good_run):
     replies = {**DEFAULT_REPLIES, "Security Auditor": "- CRITICAL: remote code execution"}
     config = cfg_from(raw_config, execution={"min_acceptable": 60})

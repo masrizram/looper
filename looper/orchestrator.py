@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from looper.config import CostBudgetExceeded, LooperConfig
-from looper.llm import OpenRouterClient
+from looper.llm import OpenRouterClient, OutOfCreditsError
 from looper.phases import CycleEvidence, PhaseManager, PhaseResult
 from looper.scoring import ScoreBreakdown, ScoringEngine
 from looper.server import HTTPServer
@@ -262,6 +262,26 @@ class LooperDaemon:
             result = await handler(goal)
             self._log(result)
             evidence.absorb(result)
+
+            # Hard stop: a 402 (account out of credits) cannot be retried into
+            # success. Continuing would only burn the remaining phases and
+            # cycles on a condition that will not change, so abort with a clear
+            # message instead of grinding to a score of 0.
+            if result.out_of_credits:
+                logger.error(
+                    "=== BUILD ABORTED: OUT OF CREDITS ===\n"
+                    "OpenRouter returned 402 Payment Required for the '%s' phase.\n"
+                    "The account has no credits, so every further agent call would\n"
+                    "fail identically. Add credits at https://openrouter.ai/settings/credits\n"
+                    "then re-run the build.",
+                    result.phase,
+                )
+                self.state.update(status="out_of_credits")
+                self.state.save()
+                raise OutOfCreditsError(
+                    "OpenRouter 402 Payment Required: account out of credits. "
+                    "Add credits at https://openrouter.ai/settings/credits"
+                )
         return evidence
 
     def _log(self, result: PhaseResult) -> None:

@@ -91,15 +91,23 @@ class AgentPhasesMixin:
 
         if reply.failed:
             self.state.record_error(f"{phase}: {reply.error}")
+            if reply.out_of_credits:
+                logger.error(
+                    "OUT OF CREDITS: OpenRouter returned 402 for the %s agent. "
+                    "The build cannot continue until credits are added at "
+                    "https://openrouter.ai/settings/credits - aborting this phase.",
+                    agent.role,
+                )
 
         result = PhaseResult(
             phase=phase,
             agent=agent.role,
             model=agent.model,
             ok=reply.ok,
-            summary="" if reply.ok else f"{agent.role} failed: {reply.error}",
+            summary=("" if reply.ok else f"{agent.role} failed: {reply.error}"),
             files_created=(written,),
             error=reply.error,
+            out_of_credits=reply.out_of_credits,
         )
         self.state.update(status=result.status)
         self.state.save()

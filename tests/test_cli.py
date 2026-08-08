@@ -14,6 +14,7 @@ from looper.cli import (
     EXIT_CONFIG_ERROR,
     EXIT_COST_EXCEEDED,
     EXIT_OK,
+    EXIT_OUT_OF_CREDITS,
     JSONLogFormatter,
     build_parser,
     main,
@@ -342,3 +343,16 @@ def test_cost_budget_exceeded_returns_exit_4(config_file, no_network, monkeypatc
 
     monkeypatch.setattr(cli, "LooperDaemon", Broke)
     assert main(["--goal", "g"]) == EXIT_COST_EXCEEDED
+
+
+def test_out_of_credits_returns_exit_6(config_file, no_network, monkeypatch):
+    """#402: a build that hits OpenRouter 402 must exit 6 with a clear signal."""
+    from looper import cli
+    from looper.llm import OutOfCreditsError
+
+    class Broke(no_network):
+        async def build(self, goal):
+            raise OutOfCreditsError("OpenRouter 402 Payment Required: account out of credits.")
+
+    monkeypatch.setattr(cli, "LooperDaemon", Broke)
+    assert main(["--goal", "g"]) == EXIT_OUT_OF_CREDITS
