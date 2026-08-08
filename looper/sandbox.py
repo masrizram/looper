@@ -18,16 +18,23 @@ import logging
 import os
 import subprocess  # nosec B404 - used with a fixed argv, never shell=True
 import tokenize
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger("looper.sandbox")
 
-#: Substring fragments whose *presence* (outside comments) means "do not run
-#: this untrusted blob on the host". Call-style fragments (subprocess.run,
-#: socket.socket) require the call; a bare ``import subprocess`` is NOT enough,
-#: and "# a comment about os.system" is stripped before scanning.
+#: Substring fragments whose *presence* (outside comments AND string literals)
+#: means "do not run this untrusted blob on the host". Call-style fragments
+#: (subprocess.run, socket.socket) require the call; a bare ``import
+#: subprocess`` is NOT enough.
+#:
+#: This table is deliberately a *superset shortlist* of the dotted paths in
+#: :data:`DANGEROUS_CALL_PATHS`: it catches the same intent expressed in a form
+#: the AST pass cannot resolve (aliased modules, attribute chains built at
+#: runtime). Entries duplicated across both tables are intentional defence in
+#: depth, and :func:`scan_source` de-duplicates the resulting reasons.
 DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("os.system", "shell execution via os.system"),
     ("os.popen", "shell execution via os.popen"),
@@ -111,7 +118,9 @@ DANGEROUS_CALL_PATHS: frozenset[str] = frozenset(
 
 #: Method names that write or delete through an object we cannot resolve
 #: statically (``Path(x).write_text``, ``open(...).write``). Flagged on the
-#: attribute alone because the receiver is unknowable at scan time.
+#: attribute alone because the receiver is unknowable at scan time -- UNLESS
+#: the receiver root is a known-isolated pytest fixture (see
+#: :data:`SANDBOXED_RECEIVERS`).
 DANGEROUS_METHOD_NAMES: frozenset[str] = frozenset(
     {
         "write_text",
@@ -126,21 +135,63 @@ DANGEROUS_METHOD_NAMES: frozenset[str] = frozenset(
     }
 )
 
+#: Receiver roots whose filesystem writes are confined by pytest itself.
+#: ``tmp_path``/``tmpdir`` hand out a per-test directory under the pytest
+#: basetemp, so ``tmp_path.write_text(...)`` cannot touch anything the suite
+#: was not already given. Flagging them refused every idiomatic pytest suite
+#: that touches disk, which meant a build whose tests used the single most
+#: common fixture in pytest could never clear the gate. Refusing good suites
+#: is not "strict" -- it is a false positive with the same cost as a miss.
+SANDBOXED_RECEIVERS: frozenset[str] = frozenset(
+    {"tmp_path", "tmp_path_factory", "tmpdir", "tmpdir_factory"}
+)
 
-def _strip_comments(source: str) -> str:
-    """Drop comments using the tokenizer, keeping string literals intact.
+#: ``getattr`` is flagged only in its two-argument, non-literal form. The
+#: three-argument ``getattr(obj, "name", default)`` and literal-name lookups
+#: are ordinary Python; treating every ``getattr`` as an exploit added noise
+#: to a tripwire whose whole value is a low false-positive rate.
 
-    A naive ``line.split("#", 1)[0]`` also truncated at a ``#`` inside a
-    string, so ``url = "http://x/#f"; os.system(cmd)`` lost the dangerous
-    call and scanned clean -- looser, not stricter, than advertised. On a
-    tokenize error (the suite may not even be valid Python) the original
-    source is returned so the substring pass still sees everything.
+
+@dataclass(frozen=True, slots=True)
+class ScanVerdict:
+    """Outcome of scanning untrusted source, split by what it should cause.
+
+    Two different questions were previously answered by one flat list:
+    "is this definitely hostile?" and "could this conceivably touch something?"
+    Both caused an outright refusal, so every widening of
+    :data:`DANGEROUS_METHOD_NAMES` risked blocking legitimate suites. Now only
+    ``refuse`` stops execution; ``warn`` is logged and left to the real
+    perimeter (the container/rlimit backend).
+    """
+
+    refuse: tuple[str, ...] = ()
+    warn: tuple[str, ...] = ()
+
+    @property
+    def refused(self) -> bool:
+        return bool(self.refuse)
+
+
+def _strip_comments_and_strings(source: str) -> str:
+    """Blank out comments *and* string literals before the substring pass.
+
+    Two bugs lived here. A naive ``line.split("#", 1)[0]`` truncated at a ``#``
+    inside a string, so ``url = "http://x/#f"; os.system(cmd)`` scanned clean.
+    Stripping only comments then left the opposite hole open in the other
+    direction: a docstring reading "never use socket. connections" tripped the
+    substring pass and refused a perfectly safe suite. String *contents* can
+    never be a call, so they are replaced with an empty literal; the AST pass
+    still sees the original source, so nothing real is lost.
     """
     try:
         tokens = list(tokenize.generate_tokens(StringIO(source).readline))
     except (tokenize.TokenError, IndentationError, SyntaxError):
         return source
-    kept = [tok for tok in tokens if tok.type != tokenize.COMMENT]
+    kept = [
+        token._replace(string='""') if token.type == tokenize.STRING else token
+        for token in tokens
+        if token.type != tokenize.COMMENT
+    ]
     try:
         return tokenize.untokenize(kept)
     except (ValueError, IndentationError):  # pragma: no cover - defensive
@@ -160,52 +211,157 @@ def _dotted_name(func: ast.expr) -> str:
     return ""
 
 
-def scan_for_dangerous_calls(source: str) -> list[str]:
-    """Return human-readable reasons the source looks unsafe to execute.
+def _receiver_root(node: ast.expr) -> str:
+    """Name at the root of an attribute/subscript/path-join chain.
 
-    An empty list means "looks ok". Comments are stripped first; bare imports
-    of a dangerous module (e.g. ``import subprocess``) are not enough on their
-    own because the ambiguous fragments require the call form (``.run``, etc.).
-    An AST pass adds detection of dangerous *calls* by fully-qualified name,
-    so ordinary helpers such as ``json.loads`` are not swept up with them.
+    ``tmp_path``, ``tmp_path / "d.json"``, ``tmp_path.joinpath("a")["b"]`` all
+    resolve to ``"tmp_path"``. Anything unresolvable yields ``""``.
+    """
+    current: ast.expr = node
+    while True:
+        if isinstance(current, (ast.Attribute, ast.Subscript)):
+            current = current.value
+        elif isinstance(current, ast.BinOp):
+            current = current.left
+        elif isinstance(current, ast.Call):
+            current = current.func
+        else:
+            break
+    return current.id if isinstance(current, ast.Name) else ""
+
+
+def _is_opaque_getattr(node: ast.Call) -> bool:
+    """True when ``getattr`` is used to reach an attribute indirectly.
+
+    Blanket-flagging every ``getattr`` was noise: ``getattr(obj, "name",
+    default)`` is ordinary Python. But a literal name is not evidence of
+    innocence either -- ``getattr(os, "system")("ls")`` is exactly the
+    indirection this tripwire exists to catch. The distinction that actually
+    matters is the *receiver*: reaching into a dangerous module by name is
+    refused whatever the form, and a plain three-argument lookup on an
+    ordinary object is not.
+    """
+    if _dotted_name(node.func) != "getattr" or len(node.args) < 2:
+        return False
+    receiver = _receiver_root(node.args[0])
+    if receiver in DANGEROUS_GETATTR_RECEIVERS:
+        return True
+    name_arg = node.args[1]
+    return not (isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str))
+
+
+#: Modules whose attributes are dangerous however they are reached. Resolving
+#: ``getattr(os, "system")`` requires naming them, since the AST cannot follow
+#: the resulting callable to its call site.
+DANGEROUS_GETATTR_RECEIVERS: frozenset[str] = frozenset(
+    {"os", "subprocess", "shutil", "socket", "ctypes", "pickle", "marshal", "builtins"}
+)
+
+
+def _sandboxed_aliases(tree: ast.AST) -> frozenset[str]:
+    """Local names that hold a path derived from an isolated pytest fixture.
+
+    Suites almost never call ``tmp_path.write_text`` directly; they write
+    ``p = tmp_path / "d.json"`` first. Resolving only the direct chain
+    therefore still refused the idiomatic form, so aliases are propagated to a
+    fixed point (``p = tmp_path / "a"``; ``q = p.parent``; both are confined).
+    Only names whose value is *rooted* in a fixture are added -- an assignment
+    from anything else, including a later rebind, is not.
+    """
+    aliases: set[str] = set(SANDBOXED_RECEIVERS)
+    # A fixed point is needed because assignments may appear in any order.
+    for _ in range(_ALIAS_RESOLUTION_PASSES):
+        grew = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            if _receiver_root(value) not in aliases:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in aliases:
+                    aliases.add(target.id)
+                    grew = True
+        if not grew:
+            break
+    return frozenset(aliases)
+
+
+#: Alias propagation is a fixed point over assignment order; suites are small
+#: and this bounds a pathological chain rather than looping unbounded.
+_ALIAS_RESOLUTION_PASSES = 8
+
+
+def scan_source(source: str) -> ScanVerdict:
+    """Classify untrusted source into refusals and warnings.
 
     This is a tripwire, not a perimeter: string concatenation and ``getattr``
     indirection defeat any static scan. Real containment comes from the
-    container/rlimit backend in :func:`run_sandboxed`.
+    container/rlimit backend in :func:`run_sandboxed`. Its job is to be right
+    in *both* directions -- a scanner that refuses good suites is as broken as
+    one that admits bad ones.
     """
-    reasons: list[str] = []
-    scanned = _strip_comments(source)
+    refuse: list[str] = []
+    warn: list[str] = []
+
+    scanned = _strip_comments_and_strings(source)
     for fragment, reason in DESTRUCTIVE_PATTERNS:
         if fragment in scanned:
-            reasons.append(reason)
+            refuse.append(reason)
 
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return reasons
+        return ScanVerdict(refuse=_dedupe(refuse), warn=_dedupe(warn))
+
+    confined = _sandboxed_aliases(tree)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         dotted = _dotted_name(node.func)
         if dotted in DANGEROUS_CALL_PATHS:
-            reasons.append(f"calls dangerous function '{dotted}'")
+            refuse.append(f"calls dangerous function '{dotted}'")
             continue
-        # getattr(os, "system") style indirection.
-        if dotted == "getattr":
-            reasons.append("dynamic attribute lookup via getattr")
+        if _is_opaque_getattr(node):
+            refuse.append("dynamic attribute lookup via getattr")
             continue
         if isinstance(node.func, ast.Attribute) and node.func.attr in DANGEROUS_METHOD_NAMES:
-            reasons.append(f"calls filesystem-mutating method '{node.func.attr}'")
+            receiver = _receiver_root(node.func.value)
+            if receiver in confined:
+                warn.append(
+                    f"writes through pytest fixture '{receiver}' via '{node.func.attr}' (allowed)"
+                )
+            else:
+                refuse.append(f"calls filesystem-mutating method '{node.func.attr}'")
 
-    # Deduplicate while preserving order: one reason per distinct problem.
+    return ScanVerdict(refuse=_dedupe(refuse), warn=_dedupe(warn))
+
+
+def _dedupe(reasons: list[str]) -> tuple[str, ...]:
+    """Order-preserving de-duplication: one reason per distinct problem."""
     seen: set[str] = set()
     unique: list[str] = []
     for reason in reasons:
         if reason not in seen:
             seen.add(reason)
             unique.append(reason)
-    return unique
+    return tuple(unique)
+
+
+def scan_for_dangerous_calls(source: str) -> list[str]:
+    """Reasons the source must not be executed. Empty list means "looks ok".
+
+    Thin wrapper over :func:`scan_source` kept as the stable public API; only
+    the refusal set is returned, because only refusals stop execution.
+    """
+    verdict = scan_source(source)
+    for note in verdict.warn:
+        logger.debug("sandbox scan note: %s", note)
+    return list(verdict.refuse)
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -407,6 +563,12 @@ def docker_argv(
     which also contains the filesystem blast radius. ``runtime`` is the
     resolved binary (``docker`` or ``podman``); both share this exact ``run``
     contract (read-only, no network, capped cpu/mem/pids).
+
+    ``--cpus`` is a *scheduler share*, not a CPU-time budget: it throttles how
+    fast a runaway loop burns, but never stops it. ``sandbox_cpu_seconds`` is
+    therefore also passed as ``--ulimit cpu=``, which is RLIMIT_CPU inside the
+    container and does kill the process -- giving the container backend the
+    same guarantee the rlimit backend already had.
     """
     inner = [to_container_path(arg, cwd) for arg in argv[1:]]
     return [
@@ -415,6 +577,7 @@ def docker_argv(
         "--rm",
         f"--network={network}",
         f"--cpus={max(1, cpu_seconds // 60) if cpu_seconds >= 60 else 1}",
+        f"--ulimit=cpu={max(1, cpu_seconds)}",
         f"--memory={max(64_000_000, rss_bytes)}b",
         "--pids-limit=256",
         "--read-only",

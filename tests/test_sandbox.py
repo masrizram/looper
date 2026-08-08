@@ -70,6 +70,8 @@ def test_adequacy_rejects_hardcoded_score():
 
 def test_adequacy_accepts_dense_suite():
     src = (
+        "from src.generated_code import main\n"
+        "\n"
         "def test_a():\n"
         "    assert 1 + 1 == 2\n"
         "    assert 2 * 2 == 4\n"
@@ -133,6 +135,8 @@ def test_adequacy_assert_inside_nested_block_in_test_counts():
     # Assert nested inside an `if` inside a test_ fn must still count (parent
     # chain walks through non-FunctionDef nodes -> coverage of 64-65).
     src = (
+        "from src.generated_code import main\n"
+        "\n"
         "def test_x():\n"
         "    for i in range(3):\n"
         "        if i == 1:\n"

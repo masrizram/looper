@@ -99,8 +99,12 @@ class PromptGenerator:
             f"Code:\n{code}\n\n"
             "Check: security vulnerabilities, performance issues, code quality, "
             "best practices, missing tests. Provide a severity rating "
-            "(critical/high/medium/low) per finding, and end with a line in the "
-            f"exact format 'Score: <0-100>'.\n\n{SCOPE_GUARD}"
+            "(critical/high/medium/low) per finding. Finish with the verdict on "
+            "a line of its own, in exactly this format and nowhere else in the "
+            "reply:\n"
+            "Score: <0-100>\n"
+            "Do not write the word 'score' anywhere else -- the number on that "
+            f"line is parsed as the build's review score.\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod

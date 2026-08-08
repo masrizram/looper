@@ -19,7 +19,7 @@ from looper.phases import (
 )
 from looper.state import StateManager
 
-from .conftest import DEFAULT_REPLIES, make_client
+from .conftest import DEFAULT_REPLIES, GENERATED_CODE, make_client
 
 
 def build_phases(config, replies=None, fail_with=None, config_dir=None) -> PhaseManager:
@@ -123,7 +123,7 @@ def test_build_marks_build_ok(config):
     phases = build_phases(config)
     result = asyncio.run(phases.run_build("goal"))
     assert result.build_ok is True
-    assert phases.read_file(CODE_FILE) == "print('hello')"
+    assert phases.read_file(CODE_FILE) == GENERATED_CODE
 
 
 def test_build_failure_sets_build_ok_false(config):
@@ -379,7 +379,12 @@ def test_subprocess_argv_is_hardened(config, monkeypatch):
     asyncio.run(phases.run_test("goal"))
 
     argv = captured["argv"]
-    assert "-I" in argv  # isolated from user site-packages
+    # -E -s, not -I: -I implies -P, which strips the workspace from
+    # sys.path and made every "import from the module under test" suite
+    # fail collection. These two keep the isolation that mattered.
+    assert "-E" in argv  # ignore PYTHON* environment variables
+    assert "-s" in argv  # ignore user site-packages
+    assert "-I" not in argv  # would break imports of the generated module
     assert "-B" in argv  # no bytecode writes
     assert "no:cacheprovider" in argv
     assert captured["kwargs"]["timeout"] == config.execution.test_timeout_seconds
@@ -633,7 +638,7 @@ def test_user_tests_failure_is_propagated(tmp_path, raw_config):
     phases = build_phases(
         config,
         config_dir=tmp_path,
-        replies={**DEFAULT_REPLIES, "Code Builder": "print('hello')"},
+        replies={**DEFAULT_REPLIES, "Code Builder": GENERATED_CODE},
     )
     asyncio.run(phases.run_build("goal"))
     result = asyncio.run(phases.run_test("goal"))
@@ -659,7 +664,7 @@ def test_relative_user_tests_dir_is_resolved_against_config_dir(tmp_path, raw_co
     phases = build_phases(
         config,
         config_dir=tmp_path,
-        replies={**DEFAULT_REPLIES, "Code Builder": "print('hello')"},
+        replies={**DEFAULT_REPLIES, "Code Builder": GENERATED_CODE},
     )
     asyncio.run(phases.run_build("goal"))
     result = asyncio.run(phases.run_test("goal"))
@@ -707,7 +712,7 @@ def test_user_tests_run_when_configured(tmp_path, raw_config):
     phases = build_phases(
         config,
         config_dir=tmp_path,
-        replies={**DEFAULT_REPLIES, "Code Builder": "print('hello')"},
+        replies={**DEFAULT_REPLIES, "Code Builder": GENERATED_CODE},
     )
     # Build so generated_code.py exists, then run the test phase.
     asyncio.run(phases.run_build("goal"))

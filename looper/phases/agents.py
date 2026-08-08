@@ -35,7 +35,16 @@ from looper.state import StateManager
 
 logger = logging.getLogger("looper.phases")
 
-REVIEW_SCORE_RE = re.compile(r"score\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+#: Matches a reviewer's verdict line, e.g. ``Score: 88``, ``**Final Score:
+#: 92/100**``. Anchored to a whole line and requiring an explicit ``:``/``=``
+#: separator: an unanchored ``score\s*[:=]?\s*(\d+)`` matched the ``3`` in
+#: prose such as "Score 3 major problems remain", so a reviewer's sentence
+#: could silently set the score to 3 and send a good build into a fix cycle.
+REVIEW_SCORE_RE = re.compile(
+    r"^[ \t]*\**\s*(?:final|overall|total)?\s*score\**\s*[:=]\s*"
+    r"(\d+(?:\.\d+)?)\s*(?:/\s*100)?\s*\**[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 class AgentPhasesMixin:
@@ -139,8 +148,16 @@ class AgentPhasesMixin:
 
         ok = design.ok and api_notes.ok
         error = design.error or api_notes.error
+        # This is the only multi-agent phase that does not route through
+        # _run_agent_phase, and it silently dropped the cross-cutting
+        # behaviour that template provides. Propagating out_of_credits is the
+        # one that matters: without it a 402 here was scored as an ordinary
+        # design failure and the orchestrator kept spending on later phases.
+        out_of_credits = design.out_of_credits or api_notes.out_of_credits
         if not ok:
             self.state.record_error(f"architecture: {error}")
+        if out_of_credits:
+            logger.error("architecture: OUT OF CREDITS")
 
         self.state.update(status="done" if ok else "error")
         self.state.save()
@@ -152,6 +169,7 @@ class AgentPhasesMixin:
             summary=("Architecture + API/UX design completed" if ok else f"Design failed: {error}"),
             files_created=(written,),
             error=error,
+            out_of_credits=out_of_credits,
         )
 
     async def run_build(self, goal: str) -> PhaseResult:
@@ -306,9 +324,11 @@ class AgentPhasesMixin:
         # A failed reviewer scores 0, never a silent pass.
         review_score = 0.0
         if reply.ok:
-            match = REVIEW_SCORE_RE.search(reply.text)
-            if match:
-                review_score = max(0.0, min(100.0, float(match.group(1))))
+            # The LAST verdict line wins: reviewers frequently restate the
+            # score in a closing summary after discussing it earlier.
+            matches = REVIEW_SCORE_RE.findall(reply.text)
+            if matches:
+                review_score = max(0.0, min(100.0, float(matches[-1])))
             else:
                 logger.warning("Review output contained no 'Score: <n>' line; scoring 0")
         else:

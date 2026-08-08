@@ -329,10 +329,12 @@ def test_stop_is_idempotent():
     asyncio.run(server.stop())
 
 
-def test_client_id_falls_back_to_unknown():
+def test_client_id_is_none_for_an_unidentifiable_peer():
+    """M-7: pooling anonymous callers into one "unknown" bucket let the first
+    of them to hit the limit lock out every other -- a self-inflicted DoS."""
     server = make_server()
     request = FakeRequest({"goal": "x"}, remote=None)
-    assert server._client_id(request) == "unknown"
+    assert server._client_id(request) is None
 
 
 def test_forwarded_for_is_ignored_from_an_untrusted_peer():

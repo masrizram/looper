@@ -51,6 +51,7 @@ class LooperDaemon:
             config.retry,
             model_prices_usd_per_1k=config.execution.model_prices_usd_per_1k,
             default_token_price_usd=config.execution.default_token_price_usd,
+            max_cost_usd=config.execution.max_cost_usd,
         )
         self.phases = phases or PhaseManager(
             config, self.state, self.client, config_dir=self._config_dir
@@ -139,6 +140,18 @@ class LooperDaemon:
             return await self._build_locked(goal)
 
     async def _build_locked(self, goal: str) -> float:
+        try:
+            return await self._build_phases(goal)
+        except CostBudgetExceeded:
+            # The ceiling is now enforced inside the LLM client, so it can fire
+            # mid-cycle rather than only at the loop guard. Persist the reason
+            # before it propagates, or /status would still read "running" for a
+            # build that has already stopped.
+            self.state.update(status="cost_exhausted")
+            self.state.save()
+            raise
+
+    async def _build_phases(self, goal: str) -> float:
         execution = self.config.execution
         self.state.reset()
         self.state.update(current_goal=goal, status="running")
@@ -223,7 +236,8 @@ class LooperDaemon:
 
         score = final.total if final else 0.0
 
-        if score >= execution.min_acceptable:
+        artifacts_complete = score >= execution.min_acceptable
+        if artifacts_complete:
             await self._run_phases(goal, self.config.final_phases, evidence)
         else:
             logger.warning(
@@ -236,6 +250,10 @@ class LooperDaemon:
             status="done",
             current_phase="done",
             score=score,
+            # A log line is invisible to anyone reading /status or the state
+            # file, so an operator could not tell a complete artifact from one
+            # missing its docs and optimisation passes.
+            artifacts_complete=artifacts_complete,
             token_usage=self.client.total_usage.as_dict(),
         )
         if self.vcs is not None:

@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from looper.config import AgentSpec, OpenRouterConfig, RetryPolicy
+from looper.config import AgentSpec, CostBudgetExceeded, OpenRouterConfig, RetryPolicy
 
 logger = logging.getLogger("looper.llm")
 
@@ -166,6 +166,7 @@ class OpenRouterClient:
         sdk: object | None = None,
         model_prices_usd_per_1k: Mapping[str, float] | None = None,
         default_token_price_usd: float = 0.002,
+        max_cost_usd: float = 0.0,
     ) -> None:
         self.config = openrouter
         self.retry = retry
@@ -173,6 +174,14 @@ class OpenRouterClient:
         self.call_count = 0
         self._model_prices = dict(model_prices_usd_per_1k or {})
         self._default_price = default_token_price_usd
+        #: Hard ceiling enforced at the point of spend. The orchestrator also
+        #: checks the budget, but only between cycles -- and one cycle is
+        #: seven agent calls. With an Opus roster a $1.00 budget reached
+        #: $18.00 before the loop guard was ever consulted, because nothing
+        #: stopped the spend *inside* a cycle. ADR-005 promises a hard
+        #: ceiling, so the ceiling has to live where the money is spent.
+        #: 0 disables the cap.
+        self._max_cost_usd = max_cost_usd
         #: Spend is accumulated per call, while the model is still known.
         #: Deriving it afterwards from ``total_usage`` is impossible: usage
         #: carries no model, so every token would be priced at the generic
@@ -218,7 +227,16 @@ class OpenRouterClient:
         *,
         extra_system: str = "",
     ) -> AgentReply:
-        """Call ``agent`` with ``prompt``, retrying only transient failures."""
+        """Call ``agent`` with ``prompt``, retrying only transient failures.
+
+        Raises :class:`~looper.config.CostBudgetExceeded` *before* issuing the
+        request when the run has already reached ``max_cost_usd``. Checking
+        here rather than only between cycles is what makes the ceiling hard:
+        a single cycle issues seven calls, so a between-cycles check alone let
+        an Opus roster overshoot a $1.00 budget by 18x.
+        """
+        self._check_budget()
+
         system_prompt = (
             f"You are the {agent.role} on an autonomous multi-agent software "
             "engineering team. Stay strictly within this role's responsibilities."
@@ -332,6 +350,16 @@ class OpenRouterClient:
             timed_out=timed_out,
             out_of_credits=out_of_credits,
         )
+
+    def _check_budget(self) -> None:
+        """Refuse a call that would spend past ``max_cost_usd``.
+
+        Raised rather than returned as a failed ``AgentReply``: an exhausted
+        budget is a run-level stop condition, not a per-agent failure the
+        pipeline should score and move past.
+        """
+        if self._max_cost_usd > 0 and self._cost_usd >= self._max_cost_usd:
+            raise CostBudgetExceeded(round(self._cost_usd, 6), self._max_cost_usd)
 
     def model_price_per_1k(self, model: str) -> float:
         """USD price per 1K tokens for ``model``, or the configured default."""

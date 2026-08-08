@@ -37,6 +37,11 @@ def test_user_test_failure_propagates_note(tmp_path, raw_config):
 
     # Stub the user-suite run so it reports a collection error note; the
     # generated suite itself must pass so run_test reaches the propagation.
+    # run_build first: the generated suite now imports the module under test
+    # (as the test prompt demands), so without the artifact on disk it fails
+    # collection and run_test never reaches the propagation path.
+    asyncio.run(phases.run_build("goal"))
+
     async def _stub_user_tests():
         return 0, 0, "pytest exited 2 with no test summary"
 

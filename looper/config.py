@@ -223,6 +223,11 @@ class ScoringWeights:
 
     unverified_build_cap: float = 60.0
     critical_finding_cap: float = 50.0
+    #: A report carrying at least this many findings is capped like a critical
+    #: one, whatever the individual severities say. Severity penalties alone
+    #: saturate: 50 UNKNOWN findings zero the security bucket and then stop
+    #: mattering, so sheer volume could clear the gate on the other three.
+    findings_volume_threshold: int = 15
 
     def __post_init__(self) -> None:
         for name in ("build", "tests", "security", "review"):
@@ -234,6 +239,12 @@ class ScoringWeights:
             _require_number(getattr(self, name), f"scoring.severity.{name}", 0.0, 100.0)
         for name in ("unverified_build_cap", "critical_finding_cap"):
             _require_number(getattr(self, name), f"scoring.{name}", 0.0, 100.0)
+        _require_int(
+            self.findings_volume_threshold,
+            "scoring.findings_volume_threshold",
+            1,
+            10_000,
+        )
 
     def penalty_for(self, severity: str) -> float:
         return {
@@ -550,6 +561,7 @@ def build_config(
         unknown=severity_raw.get("unknown", 5.0),
         unverified_build_cap=scoring_raw.get("unverified_build_cap", 60.0),
         critical_finding_cap=scoring_raw.get("critical_finding_cap", 50.0),
+        findings_volume_threshold=scoring_raw.get("findings_volume_threshold", 15),
     )
 
     retry_raw = section("retry")

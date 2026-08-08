@@ -17,6 +17,10 @@ DEFAULT_STATE: dict[str, Any] = {
     "cycle": 0,
     "score": 0.0,
     "status": "idle",
+    #: False once a build finishes below ``min_acceptable``, because the
+    #: documentation and performance phases are skipped in that case and the
+    #: artifact on disk is not the complete deliverable.
+    "artifacts_complete": True,
     "history": [],
     "files_created": [],
     "errors": [],

@@ -69,12 +69,26 @@ class FakeSDKClient:
         self.chat = FakeChat(self.completions)
 
 
+#: A suite that actually imports the artifact under test. The old default,
+#: ``def test_x(): assert True``, is precisely the tautology the adequacy gate
+#: is supposed to refuse -- every fixture in the suite was therefore asserting
+#: that a self-referential test passes the anti-overfitting gate. Fixtures that
+#: cannot survive the product's own gates test the wrong product.
+GENERATED_CODE = "def main():\n    print('hello')\n    return 42\n"
+
+ADEQUATE_SUITE = (
+    "from src.generated_code import main\n"
+    "\n"
+    "def test_main_returns_42():\n"
+    "    assert main() == 42\n"
+)
+
 DEFAULT_REPLIES = {
     "Senior Technical Researcher": "research notes",
     "System Architect": "architecture notes",
     "UX/API Designer": "api notes",
-    "Code Builder": "print('hello')",
-    "Test Generator": "def test_x(): assert True",
+    "Code Builder": GENERATED_CODE,
+    "Test Generator": ADEQUATE_SUITE,
     "Senior Reviewer": "Looks fine.\nScore: 97",
     "Security Auditor": "No issues found.",
     "Performance Optimizer": "optimized",

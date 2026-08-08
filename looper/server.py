@@ -150,17 +150,24 @@ class HTTPServer:
         # can measure response latency.
         return hmac.compare_digest(header, f"Bearer {self.config.auth_token}")
 
-    def _client_id(self, request: Any) -> str:
-        """Identify the rate-limit bucket for ``request``.
+    def _client_id(self, request: Any) -> str | None:
+        """Identify the rate-limit bucket for ``request``, or ``None``.
 
         ``X-Forwarded-For`` is honoured only when the immediate peer is a
         configured trusted proxy. Believing it unconditionally would let any
         caller forge a fresh identity per request and bypass the limit;
         ignoring it entirely behind a real proxy would collapse every client
         into one bucket. Both failure modes are worse than this check.
+
+        An unidentifiable peer returns ``None`` rather than sharing one
+        ``"unknown"`` bucket: pooling every anonymous caller together means
+        the first of them to hit the limit locks out all the others, which is
+        a self-inflicted denial of service. The caller rejects instead.
         """
         remote = getattr(request, "remote", None)
-        peer = str(remote) if remote else "unknown"
+        peer = str(remote) if remote else ""
+        if not peer:
+            return None
         if peer in self.config.trusted_proxies:
             headers = getattr(request, "headers", {})
             forwarded = headers.get("X-Forwarded-For", "") if headers else ""
@@ -198,7 +205,16 @@ class HTTPServer:
             self._counters["build_unauthorized"] += 1
             return self._json({"error": "unauthorized"}, status=401)
 
-        if not self.limiter.allow(self._client_id(request)):
+        client_id = self._client_id(request)
+        if client_id is None:
+            # Cannot attribute the request to a caller, so it cannot be rate
+            # limited. Refusing is the only option that neither grants a free
+            # unlimited lane nor lets one anonymous caller exhaust a shared
+            # bucket for every other.
+            self._counters["build_rejected"] += 1
+            return self._json({"error": "unidentifiable client"}, status=400)
+
+        if not self.limiter.allow(client_id):
             self._counters["build_rejected"] += 1
             return self._json({"error": "rate limit exceeded"}, status=429)
 

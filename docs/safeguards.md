@@ -63,9 +63,10 @@ All safeguards live under the `execution` key in `config.yaml`.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `max_cost_usd` | `0.0` (off) | Hard USD ceiling per build; `0` disables the abort (ADR-005). |
+| `max_cost_usd` | `0.0` (off) | Hard USD ceiling per build, enforced inside `OpenRouterClient.call` so it fires mid-cycle, not only at the next cycle boundary; `0` disables the abort (ADR-005, ADR-012). |
 | `model_prices_usd_per_1k` | verified roster prices | Per-model overrides, merged over the shipped defaults. |
 | `default_token_price_usd` | `0.002` | Used when a model has no explicit price. |
+| `findings_volume_threshold` | `15` | Findings count at which a report is capped like a critical one, whatever the individual severities (ADR-012). |
 
 ### Sandbox
 
@@ -76,7 +77,7 @@ All safeguards live under the `execution` key in `config.yaml`.
 | `sandbox_fail_closed` | `true` | Refuse to run generated tests when no isolation exists. |
 | `sandbox_image` | `python:3.11-slim` | Image used by the Docker backend. |
 | `sandbox_network` | `none` | Container network mode. |
-| `sandbox_cpu_seconds` | `60` | POSIX CPU-time rlimit for one test run. |
+| `sandbox_cpu_seconds` | `60` | CPU-time cap for one test run: a POSIX `RLIMIT_CPU` under the rlimit backend, and `--ulimit cpu=` under Docker/Podman. (`--cpus` is only a scheduler share and never stops a runaway loop, so it is not the cap — ADR-012.) |
 | `sandbox_wall_seconds` | `300` | POSIX wall-time rlimit. |
 | `sandbox_rss_bytes` | `1_000_000_000` | POSIX address-space rlimit. |
 
@@ -84,7 +85,7 @@ All safeguards live under the `execution` key in `config.yaml`.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `min_test_assertions_per_100_lines` | `6` | Assertion-density floor; `0` disables it. |
+| `min_test_assertions_per_100_lines` | `6` | Assertion-density floor, counting `assert`, `self.assert*` and `pytest.raises`; a suite that imports nothing under test is refused whatever its density. `0` disables the floor (ADR-012). |
 | `user_tests_dir` | `""` (off) | Dir of human-owned tests the AI cannot see or edit. |
 | `lint_generated` | `"py_compile"` | `off` \| `py_compile` \| `flake8` gate on generated code. |
 

@@ -29,21 +29,35 @@ DOCS_FILE = "docs/README.md"
 
 #: Agents habitually wrap code in ```python fences, and often prefix the
 #: block with prose ("Here is the code:"). Parsing the fenced text as Python
-#: would always raise, so the first fenced block's body is extracted; if there
-#: is no fence the text is returned unchanged (the builder may emit bare code).
-_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+#: would always raise, so a fenced block's body is extracted; if there is no
+#: fence the text is returned unchanged (the builder may emit bare code).
+_FENCE_RE = re.compile(r"```([^\n]*)\n(.*?)```", re.DOTALL)
+
+#: Fence languages that denote Python source.
+_PYTHON_FENCE_LANGS: frozenset[str] = frozenset({"", "py", "python", "python3"})
 
 
 def strip_code_fences(text: str) -> str:
-    """Return the body of the first fenced block, or ``text`` unchanged.
+    """Return the body of the most plausible code block, or ``text`` unchanged.
 
     A non-anchored search (not ``match``) is deliberate: a reply such as
     "Here is the code:\\n```python\\nx = 1\\n```" must yield ``x = 1``, not the
     whole fenced string, otherwise ``ast.parse`` rejects valid code and the
     build fails closed for no reason.
+
+    Taking the *first* block was wrong for the common reply shape "here is a
+    small example ... and here is the full module": the throwaway snippet was
+    written to disk and the real artifact silently discarded. Python-tagged
+    blocks are preferred, and among candidates the longest wins, because the
+    module under construction is essentially never the shortest block in the
+    reply.
     """
-    match = _FENCE_RE.search(text or "")
-    return match.group(1).strip() if match else (text or "")
+    blocks: list[tuple[str, str]] = _FENCE_RE.findall(text or "")
+    if not blocks:
+        return text or ""
+    python_blocks = [body for lang, body in blocks if lang.strip().lower() in _PYTHON_FENCE_LANGS]
+    candidates = python_blocks or [body for _, body in blocks]
+    return max(candidates, key=len).strip()
 
 
 class WorkspaceMixin:

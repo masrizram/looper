@@ -156,11 +156,21 @@ class ExecutionMixin:
         return await self._run_pytest(user_path)
 
     async def _run_pytest(self, tests_dir: Path) -> tuple[int, int, str]:
-        """Launch pytest for ``tests_dir`` with sandboxing where available."""
+        """Launch pytest for ``tests_dir`` with sandboxing where available.
+
+        Isolation is ``-E -s`` rather than ``-I``. ``-I`` implies ``-P``,
+        which drops the script directory from ``sys.path`` -- so every suite
+        that did the one thing the test prompt demands ("import from the
+        module under test") failed collection with ``ModuleNotFoundError``,
+        scoring 0 tests for reasons that had nothing to do with the code.
+        ``-E`` (ignore PYTHON* env vars) and ``-s`` (ignore user site-packages)
+        keep the isolation that actually mattered.
+        """
         exec_cfg = self.config.execution
         argv = [
             sys.executable,
-            "-I",
+            "-E",
+            "-s",
             "-B",
             "-m",
             "pytest",

@@ -31,13 +31,35 @@ NO_ISSUES_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Words that flip the meaning of a "clean" phrase. "It is NOT true that there
+#: are no vulnerabilities" matched the clean pattern and scored a report full
+#: of findings as spotless -- a false negative in the one direction this
+#: project cannot afford. When a negation precedes the match on the same line,
+#: the phrase is not a clean bill of health.
+_NEGATION_RE = re.compile(
+    r"\b(?:not|isn't|is\s+not|aren't|are\s+not|wasn't|no\s+longer|false|untrue|"
+    r"cannot\s+say|can't\s+say|hardly|barely|far\s+from)\b",
+    re.IGNORECASE,
+)
+
 #: Kept for backwards compatibility with callers that iterate the markers.
 NO_ISSUES_MARKERS = ("no issues found", "no vulnerabilities found", "no findings")
 
 
 def reports_no_issues(text: str) -> bool:
-    """True when an auditor's prose declares the code clean."""
-    return bool(NO_ISSUES_RE.search(text or ""))
+    """True when an auditor's prose declares the code clean.
+
+    A negation anywhere earlier on the matching line disqualifies it: the
+    phrase is being contradicted, not asserted.
+    """
+    for line in (text or "").splitlines():
+        match = NO_ISSUES_RE.search(line)
+        if match is None:
+            continue
+        if _NEGATION_RE.search(line[: match.start()]):
+            continue
+        return True
+    return False
 
 
 SEVERITY_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
@@ -145,6 +167,13 @@ class ScoringEngine:
             total = min(total, weights.unverified_build_cap)
         if any(severity_of(issue) == "CRITICAL" for issue in security_issues):
             caps.append("critical_finding")
+            total = min(total, weights.critical_finding_cap)
+        # Volume is evidence too. Severity penalties alone let 50 UNKNOWN-
+        # severity findings zero the security weight and still clear the gate
+        # on build+tests+review, because no CRITICAL was present to trip a cap.
+        # A report that long is not a passing build regardless of labelling.
+        if len(security_issues) >= weights.findings_volume_threshold:
+            caps.append("finding_volume")
             total = min(total, weights.critical_finding_cap)
 
         return ScoreBreakdown(
