@@ -1,15 +1,16 @@
 # =============================================================================
-# Looper - konfigurasi FREE untuk smoke-test pipeline TANPA bayar.
+# Looper - FREE configuration for a no-cost smoke-test of the pipeline.
 # -----------------------------------------------------------------------------
-# Semua agent pakai model ber-akhiran ":free" (tidak memotong kredit OpenRouter).
-# Slug sudah diverifikasi ada di katalog live via `looper --check-models`.
+# Every agent uses a ":free"-suffixed model (it does not draw down OpenRouter
+# credits). The slugs were verified to exist in the live catalogue via
+# `looper --check-models`.
 #
-# CATATAN: model free (9B-31B) jarang sanggup tembus gate tinggi seperti 99.
-# Makanya target_score/min_acceptable diturunkan -> pipeline tetap jalan end-to-end
-# sebagai bukti alur, bukan untuk hasil produksi.
+# NOTE: free models (9B-31B) rarely clear a high gate like 99. That is why
+# target_score/min_acceptable are lowered here -- the pipeline still runs
+# end-to-end as a proof of the flow, not to produce production-grade output.
 #
-# Jalankan:
-#   $env:OPENROUTER_API_KEY="sk-or-..."   # key tetap wajib untuk auth (free tdk byr)
+# Run with:
+#   $env:OPENROUTER_API_KEY="sk-or-..."   # a key is still required for auth (free does not bill)
 #   looper --config config_free.yaml --goal "build a CLI calculator"
 # =============================================================================
 
@@ -24,10 +25,10 @@ execution:
   test_timeout_seconds: 600
   max_history_entries: 500
   max_file_bytes: 2000000
-  max_cost_usd: 0.0               # free: tidak ada plafon biaya
-  default_token_price_usd: 0.0     # free: harga 0
+  max_cost_usd: 0.0               # free: no cost ceiling
+  default_token_price_usd: 0.0     # free: zero price
   user_tests_dir: ""
-  min_test_assertions_per_100_lines: 0   # free model lemah di test; nonaktifkan lantai
+  min_test_assertions_per_100_lines: 0   # free models are weak at tests; disable the floor
   sandbox_tests: true
   sandbox_cpu_seconds: 60
   sandbox_wall_seconds: 300
@@ -49,11 +50,11 @@ openrouter:
   site_name: "Looper Daemon (free)"
   request_timeout_seconds: 300
 
-# --- Tiering model FREE (hindari silent fallback; eksplisit di config) ------
+# --- FREE model tiering (explicit in config; no silent fallback) ------------
 # Builder  = cohere/north-mini-code    (code specialist)
-# Tester   = openai/gpt-oss-20b        (KELUARGA BERBEDA dari builder - ADR-006)
-# Reviewer = google/gemma-4-31b-it     (KELUARGA BERBEDA dari builder - ADR-006)
-# Sisanya  = gpt-oss / gemma / nemotron (free, cukup untuk prose & reasoning)
+# Tester   = openai/gpt-oss-20b        (DIFFERENT family from builder - ADR-006)
+# Reviewer = google/gemma-4-31b-it     (DIFFERENT family from builder - ADR-006)
+# Rest     = gpt-oss / gemma / nemotron (free, adequate for prose & reasoning)
 agents:
   researcher:        { model: "google/gemma-4-31b-it:free",  role: "Senior Technical Researcher", temperature: 0.3 }
   architect:         { model: "openai/gpt-oss-20b:free",      role: "System Architect",           temperature: 0.3 }

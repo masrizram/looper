@@ -1,113 +1,113 @@
 # =============================================================================
 # Looper Daemon configuration
 # -----------------------------------------------------------------------------
-# Dibaca oleh looper/config.py (default: config.yaml, fallback looper_config.yaml).
-# Semua field OPSIONAL -- yang tidak ditulis memakai default di kode.
+# Read by looper/config.py (default: config.yaml, fallback looper_config.yaml).
+# All fields are OPTIONAL -- any omitted field falls back to the code default.
 #
-# ATURAN KEAMANAN: file ini TIDAK PERNAH menyimpan secret. Yang disimpan hanya
-# NAMA environment variable (mis. api_key_env), nilainya diambil dari env.
+# SECURITY RULE: this file NEVER stores secrets. It only holds the NAME of an
+# environment variable (e.g. api_key_env); the actual value is read from env.
 #
-# Validasi config: python -m looper.cli --check-config
+# Validate config: python -m looper.cli --check-config
 # =============================================================================
 
-# Direktori kerja relatif terhadap CWD saat menjalankan daemon.
+# Working directory, relative to the CWD when the daemon is launched.
 workspace: "./workspace"
 state_file: "./looper_state.json"
 watch_file: "./looper_commands.txt"
 
-# Interval polling watch_file, dalam detik.
+# Poll interval for the watch_file, in seconds.
 watch_interval: 2.0
 
 # --- HTTP API server ---------------------------------------------------------
-# PERINGATAN: POST /build memicu eksekusi kode buatan LLM. Perlakukan endpoint
-# ini sebagai remote code execution. Default bind 127.0.0.1 (localhost saja).
-# Bind APA PUN selain loopback (0.0.0.0, ::, atau alamat LAN) TANPA auth
-# token akan DITOLAK saat startup (bukan cuma warning). Lihat ADR-004.
+# WARNING: POST /build triggers execution of LLM-generated code. Treat this
+# endpoint as remote code execution. It binds 127.0.0.1 (localhost only) by default.
+# Binding ANYTHING other than loopback (0.0.0.0, ::, or a LAN address) WITHOUT an
+# auth token is REJECTED at startup (not merely warned about). See ADR-004.
 http:
   bind: "127.0.0.1"
   port: 9999
-  # Nama env var berisi bearer token. Dibandingkan constant-time (hmac).
+  # Name of the env var holding the bearer token. Compared constant-time (hmac).
   auth_token_env: "LOOPER_HTTP_TOKEN"
-  # Batas ukuran body request (byte) -- cegah memory exhaustion.
+  # Request body size limit (bytes) -- prevents memory exhaustion.
   max_body_bytes: 65536
-  # Batas panjang goal (karakter) -- cegah biaya LLM tak terbatas.
+  # Goal length limit (characters) -- prevents unbounded LLM spend.
   max_goal_length: 20000
-  # Batas request /build per menit per alamat IP.
+  # /build request limit per minute per client IP address.
   rate_limit_per_minute: 10
 
 execution:
   max_cycles: 5
   target_score: 99
   min_acceptable: 95
-  # Hard timeout untuk pytest atas kode buatan LLM. Tanpa ini, satu
-  # infinite-loop di generated test menggantung daemon 24/7 selamanya.
+  # Hard timeout for pytest over LLM-generated code. Without it, a single
+  # infinite loop in a generated test would hang the 24/7 daemon forever.
   test_timeout_seconds: 600
-  # Batas entri history/errors di state -- cegah file state tumbuh tanpa henti.
+  # Cap on history/error entries in the state file -- stops it growing forever.
   max_history_entries: 500
-  # Batas byte per file yang ditulis dari output agent. LLM yang ngeloop
-  # bisa memenuhi disk daemon 24/7; kelebihannya dipotong + ditandai.
+  # Per-file byte cap for agent output. An agent that loops could fill the
+  # daemon's disk; overflow is truncated and flagged.
   max_file_bytes: 2000000
-  # Plafon biaya API per build (USD). 0 = tanpa batas. Lewati nilai ini ->
-  # build dihentikan paksa (exit code 4), bukan terus menumpuk tagihan. ADR-005.
+  # Per-build API cost ceiling (USD). 0 = unlimited. Exceeding it aborts the
+  # build forcibly (exit code 4) instead of stacking up the bill. ADR-005.
   max_cost_usd: 0.0
-  # Harga default USD per 1K token (dipakai estimasi biaya). Bisa diper-tight
-  # per model lewat model_prices_usd_per_1k (lihat contoh di bawah).
+  # Default USD price per 1K tokens (used for cost estimates). Can be tightened
+  # per model via model_prices_usd_per_1k (see the example below).
   default_token_price_usd: 0.002
   # model_prices_usd_per_1k:
   #   "anthropic/claude-3.5-sonnet": 0.003
   #   "openai/gpt-4o": 0.005
-  # Path ke suite pytest MILIK ANDA (relatif thd config atau absolut).
-  # Kode AI harus LULUS test ini juga sebelum build dianggap selesai --
-  # menutup celah overfitting (AI menulis test lemah untuk dirinya sendiri). ADR-06.
+  # Path to YOUR OWN pytest suite (relative to the config dir or absolute).
+  # The AI code must ALSO pass these tests before the build is considered done --
+  # closes the overfitting hole (the AI writing weak tests for itself). ADR-06.
   user_tests_dir: ""
-  # Tolak suite test buatan AI yang terlalu tipis (assert per 100 baris).
-  # 0 = nonaktifkan lantai ini.
+  # Reject AI-written test suites that are too thin (asserts per 100 lines).
+  # 0 = disable this floor.
   min_test_assertions_per_100_lines: 6
-  # Jalankan pytest suite di bawah resource limit (CPU/wall/RSS) agar kode
-  # AI yang ngeloop/boros tak bisa gantung atau OOM host. Selalu scan statis
-  # suite dulu: panggilan os.system/subprocess/network/eval DITOLAK dijalankan. ADR-06.
+  # Run the pytest suite under resource limits (CPU/wall/RSS) so looping or
+  # wasteful AI code cannot hang or OOM the host. The suite is always statically
+  # scanned first: os.system/subprocess/network/eval calls are REFUSED. ADR-06.
   sandbox_tests: true
   sandbox_cpu_seconds: 60
   sandbox_wall_seconds: 300
   sandbox_rss_bytes: 1000000000
-  # Backend isolasi: auto | rlimit | docker | none. ADR-008.
-  #   auto   -> pilih Docker kalau daemon-nya hidup, kalau tidak POSIX rlimits.
-  #   docker -> container sekali pakai: read-only, tanpa network, cpu/memory/pids
-  #             dibatasi. SATU-SATUNYA opsi dengan jaminan sama di Windows.
-  #   rlimit -> preexec_fn + RLIMIT_CPU/RLIMIT_AS (POSIX saja).
-  #   none   -> TANPA isolasi. Kode buatan LLM jalan langsung di host.
+  # Isolation backend: auto | rlimit | docker | none. ADR-008.
+  #   auto   -> prefer Docker if present, otherwise POSIX rlimits.
+  #   docker -> single-use container: read-only, no network, cpu/memory/pids
+  #             capped. The ONLY option with identical guarantees on Windows.
+  #   rlimit -> preexec_fn + RLIMIT_CPU/RLIMIT_AS (POSIX only).
+  #   none   -> NO isolation. LLM-generated code runs directly on the host.
   sandbox_backend: "auto"
   sandbox_image: "python:3.11-slim"
   sandbox_network: "none"
-  # PENTING: kalau tidak ada backend isolasi yang tersedia, TOLAK menjalankan
-  # test buatan AI (bukan diam-diam jalan tanpa proteksi). Cek dulu dengan
-  # `python -m looper.cli --doctor` -- exit 5 artinya host ini tidak aman.
-  # Set false hanya kalau Anda sadar menerima risikonya. ADR-008.
+  # IMPORTANT: if no isolation backend is available, REFUSE to run AI-authored
+  # tests (rather than silently running them unprotected). Check first with
+  # `python -m looper.cli --doctor` -- exit 5 means this host is unsafe.
+  # Set false only if you consciously accept the risk. ADR-008.
   sandbox_fail_closed: true
-  # single_file -> satu src/generated_code.py (default, perilaku lama).
-  # package     -> builder boleh mengeluarkan pohon multi-file lewat penanda
-  #                "### FILE: path". Path lewat allowlist, jumlah dibatasi. ADR-009.
+  # single_file -> one src/generated_code.py (the default, legacy behaviour).
+  # package     -> the builder may emit a multi-file tree via the "### FILE: path"
+  #                marker. Paths pass an allowlist; the count is capped. ADR-009.
   artifact_mode: "single_file"
   max_files_per_build: 25
-  # Rekam tiap build ke git supaya hasilnya bisa direview pakai `git diff`. ADR-010.
+  # Record each build to git so the output can be reviewed with `git diff`. ADR-010.
   git:
     enabled: false
     branch_prefix: "looper/"
     commit_per_cycle: true
     author_name: "looper"
     author_email: "looper@localhost"
-  # Lint kode hasil AI sebelum diterima: py_compile (default) / flake8 / off.
+  # Lint AI-generated code before accepting it: py_compile (default) / flake8 / off.
   lint_generated: "py_compile"
 
-# --- Kebijakan retry panggilan LLM -------------------------------------------
+# --- LLM call retry policy --------------------------------------------------
 retry:
   max_attempts: 3
-  backoff_base: 2.0   # detik; eksponensial 2s, 4s, 8s, ...
-  backoff_max: 60.0   # plafon per-jeda
+  backoff_base: 2.0   # seconds; exponential 2s, 4s, 8s, ...
+  backoff_max: 60.0   # per-backoff cap
 
-# --- Bobot skor (harus berjumlah 100) ----------------------------------------
-# severity: penalti per temuan keamanan, dikurangkan dari jatah "security".
-# Lihat docs/adr/002-fail-closed-scoring.md untuk alasannya.
+# --- Score weights (must sum to 100) -----------------------------------------
+# severity: penalty per security finding, subtracted from the "security" bucket.
+# See docs/adr/002-fail-closed-scoring.md for the rationale.
 scoring:
   build: 20
   tests: 30
@@ -119,35 +119,36 @@ scoring:
     medium: 5
     low: 2
     unknown: 5
-  # Plafon keras: build/test tak terverifikasi tak pernah masuk band rilis.
+  # Hard cap: unverified build/test never enters the release band.
   unverified_build_cap: 60
-  # Plafon keras: satu temuan CRITICAL menggagalkan gate.
+  # Hard cap: a single CRITICAL finding fails the gate.
   critical_finding_cap: 50
 
-# --- Koneksi ke OpenRouter ---------------------------------------------------
+# --- Connection to OpenRouter ------------------------------------------------
 openrouter:
   base_url: "https://openrouter.ai/api/v1"
-  # HANYA nama environment variable, BUKAN API key-nya.
-  # Export di shell:  export OPENROUTER_API_KEY=sk-or-...
+  # ONLY the environment variable name, NOT the API key itself.
+  # Export in the shell:  export OPENROUTER_API_KEY=sk-or-...
   api_key_env: "OPENROUTER_API_KEY"
-  site_url: ""            # opsional, untuk ranking di openrouter.ai
+  site_url: ""            # optional, used for ranking on openrouter.ai
   site_name: "Looper Daemon"
-  # Hard timeout satu panggilan LLM (detik). Tanpa ini satu koneksi macet
-  # menggantung phase -- dan seluruh daemon -- tanpa batas.
+  # Hard timeout for a single LLM call (seconds). Without it a stalled
+  # connection would hang the phase -- and the whole daemon -- indefinitely.
   request_timeout_seconds: 300
 
 # --- Role -> model -----------------------------------------------------------
-# Field opsional per agent: model, role, temperature, max_tokens.
-# Ganti string "model" kapan saja tanpa menyentuh kode.
+# Optional per-agent fields: model, role, temperature, max_tokens.
+# Swap the "model" string any time without touching the code.
 agents:
-  # Tiered assignment. Semua slug DIVERIFIKASI terhadap katalog live OpenRouter
-  # (`python -m looper.cli --check-models`). Slug yang salah lolos --check-config
-  # (bentuknya string valid) dan baru meledak di tengah build setelah fase
-  # sebelumnya terlanjur dibayar -- makanya ada perintah verifikasi tersendiri.
+  # Tiered assignment. Every slug is VERIFIED against the live OpenRouter
+  # catalogue (`python -m looper.cli --check-models`). A wrong slug passes
+  # --check-config (it is a valid-looking string) and only explodes mid-build
+  # after earlier phases have already been billed -- which is why there is a
+  # dedicated verification command.
   #
-  # Tier 1 Frontier (~$5-30/M) -> reasoning, volume token rendah
-  # Tier 2 Daily   (~$2-10/M)  -> coding, volume token tinggi
-  # Tier 3 Cheap   (~$1-12/M)  -> prosa panjang, context besar
+  # Tier 1 Frontier (~$5-30/M) -> reasoning, low token volume
+  # Tier 2 Daily   (~$2-10/M)  -> coding, high token volume
+  # Tier 3 Cheap   (~$1-12/M)  -> long-form prose, large context
   researcher:
     model: "anthropic/claude-opus-5"
   architect:
@@ -156,13 +157,14 @@ agents:
     model: "openai/gpt-5.6-sol"
   builder:
     model: "anthropic/claude-sonnet-5"
-  # Desain test adalah tempat overfitting ketahuan, jadi pakai model frontier
-  # dari KELUARGA BERBEDA dengan builder. Kalau penulis kode dan penulis test
-  # model yang sama, blind spot-nya ikut sama. ADR-006.
+  # Test design is where overfitting is caught, so use a frontier model from a
+  # DIFFERENT family than the builder. If the code author and the test author
+  # share a model, their blind spots line up. ADR-006.
   tester:
     model: "anthropic/claude-opus-5"
-  # Reviewer juga sengaja beda keluarga dari builder (Sonnet), supaya review
-  # benar-benar independen, bukan model menilai gaya tulisannya sendiri.
+  # The reviewer is also deliberately a different family from the builder
+  # (Sonnet), so the review is genuinely independent rather than the model
+  # grading its own writing style.
   reviewer:
     model: "openai/gpt-5.6-terra"
   security_auditor:
@@ -174,10 +176,10 @@ agents:
   fixer:
     model: "anthropic/claude-sonnet-5"
 
-# --- Phase yang dijalankan (opsional) ----------------------------------------
-# phases:        siklus pertama (pipeline lengkap)
-# retry_phases:  siklus ulang setelah fix (hanya re-validasi)
-# final_phases:  sekali jalan setelah gate skor terpenuhi
+# --- Phases to run (optional) -----------------------------------------------
+# phases:        first cycle (full pipeline)
+# retry_phases:  repeat after a fix (re-validation only)
+# final_phases:  run once after the score gate is met
 # phases:
 #   - research
 #   - architecture
