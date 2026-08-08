@@ -18,7 +18,13 @@ def test_user_test_failure_propagates_note(tmp_path, raw_config):
     """#3: a user suite that fails to collect must surface a non-empty note that
     propagates into the run_test summary (phases.py:391-392)."""
     config = build_config(
-        {**raw_config, "execution": {"user_tests_dir": str(tmp_path / "ut")}},
+        {
+            **raw_config,
+            "execution": {
+                "user_tests_dir": str(tmp_path / "ut"),
+                "sandbox_tests": False,
+            },
+        },
         env={},
     )
     state = StateManager(config.state_file, config.execution.max_history_entries)

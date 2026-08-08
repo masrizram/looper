@@ -55,14 +55,28 @@ class PromptGenerator:
         )
 
     @staticmethod
-    def build(goal: str, architecture: str) -> str:
+    def build(goal: str, architecture: str, *, package_mode: bool = False) -> str:
+        # In package mode the parser only recognises one marker syntax, so the
+        # prompt has to name it exactly; anything else falls back to the
+        # single-file path and the multi-file feature silently never fires.
+        output_rule = (
+            "Output EVERY file using this exact marker syntax, one per file:\n"
+            "### FILE: relative/path/to/file.py\n"
+            "```python\n"
+            "<complete file contents>\n"
+            "```\n"
+            "Use only relative paths (no leading '/', no '..'). Allowed "
+            "extensions: .py .md .txt .toml .cfg .ini .json .yaml .yml."
+            if package_mode
+            else "Output each file in a separate code block with filename header."
+        )
         return (
             "You are an expert code builder. Generate ALL production-ready code "
             f"for:\n\n{goal}\n\n"
             f"Based on this architecture:\n{architecture}\n\n"
             "Rules: NO placeholders, NO TODOs, NO incomplete code. "
             "Every file must be complete and functional. Include tests. "
-            f"Output each file in a separate code block with filename header.\n\n{SCOPE_GUARD}"
+            f"{output_rule}\n\n{SCOPE_GUARD}"
         )
 
     @staticmethod

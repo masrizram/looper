@@ -20,6 +20,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from looper.sandbox import SANDBOX_BACKENDS
+
 logger = logging.getLogger("looper.config")
 
 DEFAULT_CONFIG_FILENAMES = ("config.yaml", "looper_config.yaml")
@@ -258,6 +260,27 @@ class ExecutionConfig:
     sandbox_cpu_seconds: int = 60
     sandbox_wall_seconds: int = 300
     sandbox_rss_bytes: int = 1_000_000_000
+    #: Which isolation backend to use: auto|rlimit|docker|none. "auto" prefers
+    #: Docker (identical guarantees on every OS) then POSIX rlimits. ADR-008.
+    sandbox_backend: str = "auto"
+    sandbox_image: str = "python:3.11-slim"
+    #: Docker network mode for the sandbox container. "none" = no network.
+    sandbox_network: str = "none"
+    #: When no isolation backend is available, REFUSE to run LLM-authored
+    #: tests rather than silently running them unconfined. Setting this false
+    #: reintroduces the fail-open hole and is logged loudly. ADR-008.
+    sandbox_fail_closed: bool = True
+    #: single_file -> one src/generated_code.py; package -> the builder may
+    #: emit a multi-file tree, capped by max_files_per_build. ADR-009.
+    artifact_mode: str = "single_file"
+    max_files_per_build: int = 25
+    #: Commit each build's workspace to git on a dedicated branch so the
+    #: output is reviewable with the normal `git diff` tooling. ADR-010.
+    git_enabled: bool = False
+    git_branch_prefix: str = "looper/"
+    git_commit_per_cycle: bool = True
+    git_author_name: str = "looper"
+    git_author_email: str = "looper@localhost"
     #: Lint the generated code with `python -m py_compile`/flake8 before it is
     #: accepted, so obviously-broken or style-corrupt output never reaches the
     #: "done" state. Set to "off" to skip.
@@ -301,6 +324,21 @@ class ExecutionConfig:
                 "execution.lint_generated must be off|py_compile|flake8, got "
                 f"{self.lint_generated!r}"
             )
+        if self.sandbox_backend not in SANDBOX_BACKENDS:
+            raise ConfigError(
+                "execution.sandbox_backend must be one of "
+                f"{list(SANDBOX_BACKENDS)}, got {self.sandbox_backend!r}"
+            )
+        if not self.sandbox_image:
+            raise ConfigError("execution.sandbox_image must not be empty")
+        if self.artifact_mode not in ("single_file", "package"):
+            raise ConfigError(
+                "execution.artifact_mode must be single_file|package, got "
+                f"{self.artifact_mode!r}"
+            )
+        _require_int(self.max_files_per_build, "execution.max_files_per_build", 1, 1000)
+        if not self.git_branch_prefix:
+            raise ConfigError("execution.git_branch_prefix must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +456,9 @@ def build_config(
     )
 
     exec_raw = section("execution")
+    git_raw = exec_raw.get("git") or {}
+    if not isinstance(git_raw, Mapping):
+        raise ConfigError(f"execution.git must be a mapping, got {git_raw!r}")
     execution = ExecutionConfig(
         max_cycles=exec_raw.get("max_cycles", 5),
         target_score=exec_raw.get("target_score", 99.0),
@@ -434,6 +475,17 @@ def build_config(
         sandbox_cpu_seconds=exec_raw.get("sandbox_cpu_seconds", 60),
         sandbox_wall_seconds=exec_raw.get("sandbox_wall_seconds", 300),
         sandbox_rss_bytes=exec_raw.get("sandbox_rss_bytes", 1_000_000_000),
+        sandbox_backend=str(exec_raw.get("sandbox_backend", "auto")),
+        sandbox_image=str(exec_raw.get("sandbox_image", "python:3.11-slim")),
+        sandbox_network=str(exec_raw.get("sandbox_network", "none")),
+        sandbox_fail_closed=bool(exec_raw.get("sandbox_fail_closed", True)),
+        artifact_mode=str(exec_raw.get("artifact_mode", "single_file")),
+        max_files_per_build=exec_raw.get("max_files_per_build", 25),
+        git_enabled=bool(git_raw.get("enabled", False)),
+        git_branch_prefix=str(git_raw.get("branch_prefix", "looper/")),
+        git_commit_per_cycle=bool(git_raw.get("commit_per_cycle", True)),
+        git_author_name=str(git_raw.get("author_name", "looper")),
+        git_author_email=str(git_raw.get("author_email", "looper@localhost")),
         lint_generated=exec_raw.get("lint_generated", "py_compile"),
     )
 

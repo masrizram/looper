@@ -15,6 +15,7 @@ from looper.phases import CycleEvidence, PhaseManager, PhaseResult
 from looper.scoring import ScoreBreakdown, ScoringEngine
 from looper.server import HTTPServer
 from looper.state import StateManager
+from looper.vcs import BuildRepo, GitRepo
 from looper.watcher import FileWatcher
 
 logger = logging.getLogger("looper.orchestrator")
@@ -39,6 +40,7 @@ class LooperDaemon:
         phases: PhaseManager | None = None,
         server: HTTPServer | None = None,
         watcher: FileWatcher | None = None,
+        vcs: BuildRepo | None = None,
         config_dir: Path | None = None,
     ) -> None:
         self.config = config
@@ -62,6 +64,21 @@ class LooperDaemon:
         )
         self._build_lock = asyncio.Lock()
         self._running = False
+        self.vcs = vcs or self._default_vcs()
+
+    def _default_vcs(self) -> BuildRepo | None:
+        """Build a git session when enabled, else None (feature stays off)."""
+        execution = self.config.execution
+        if not execution.git_enabled:
+            return None
+        return BuildRepo(
+            GitRepo(
+                Path(self.config.workspace),
+                author_name=execution.git_author_name,
+                author_email=execution.git_author_email,
+            ),
+            branch_prefix=execution.git_branch_prefix,
+        )
 
     # -- Introspection ---------------------------------------------------
 
@@ -129,6 +146,13 @@ class LooperDaemon:
         evidence = CycleEvidence()
         cycle = 0
 
+        if self.vcs is not None:
+            branch = await asyncio.to_thread(self.vcs.start, goal)
+            if branch:
+                logger.info("Recording this build on git branch %s", branch)
+                self.state.update(git=self.vcs.as_dict())
+                self.state.save()
+
         while cycle < execution.max_cycles:
             # Hard cost ceiling: abort before spending more, rather than
             # silently running up the API bill. ADR-005.
@@ -170,6 +194,15 @@ class LooperDaemon:
             self.state.save()
             logger.info("Score: %.2f %s", final.total, final.as_dict())
 
+            if self.vcs is not None and execution.git_commit_per_cycle:
+                sha = await asyncio.to_thread(
+                    self.vcs.record_cycle, cycle, final.total, final.summary_line()
+                )
+                if sha:
+                    logger.info("Cycle %d committed as %s", cycle, sha)
+                    self.state.update(git=self.vcs.as_dict())
+                    self.state.save()
+
             if final.total >= execution.target_score:
                 logger.info("Target score reached; stopping early")
                 break
@@ -203,6 +236,11 @@ class LooperDaemon:
             score=score,
             token_usage=self.client.total_usage.as_dict(),
         )
+        if self.vcs is not None:
+            sha = await asyncio.to_thread(self.vcs.record_cycle, cycle, score, "final artifact")
+            if sha:
+                logger.info("Final artifact committed as %s", sha)
+            self.state.update(git=self.vcs.as_dict())
         self.state.save()
         logger.info("Build complete. Final score: %.2f", score)
         return score

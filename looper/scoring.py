@@ -59,6 +59,16 @@ class ScoreBreakdown:
             "caps_applied": list(self.caps_applied),
         }
 
+    def summary_line(self) -> str:
+        """One-line human summary, used as a git commit body (ADR-010)."""
+        parts = (
+            f"build={self.build:.0f} tests={self.tests:.0f} "
+            f"security={self.security:.0f} review={self.review:.0f}"
+        )
+        if self.caps_applied:
+            parts += f" caps={','.join(self.caps_applied)}"
+        return parts
+
 
 class ScoringEngine:
     """Turns phase evidence into a 0-100 release score.

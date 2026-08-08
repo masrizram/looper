@@ -70,6 +70,32 @@ execution:
   sandbox_cpu_seconds: 60
   sandbox_wall_seconds: 300
   sandbox_rss_bytes: 1000000000
+  # Backend isolasi: auto | rlimit | docker | none. ADR-008.
+  #   auto   -> pilih Docker kalau daemon-nya hidup, kalau tidak POSIX rlimits.
+  #   docker -> container sekali pakai: read-only, tanpa network, cpu/memory/pids
+  #             dibatasi. SATU-SATUNYA opsi dengan jaminan sama di Windows.
+  #   rlimit -> preexec_fn + RLIMIT_CPU/RLIMIT_AS (POSIX saja).
+  #   none   -> TANPA isolasi. Kode buatan LLM jalan langsung di host.
+  sandbox_backend: "auto"
+  sandbox_image: "python:3.11-slim"
+  sandbox_network: "none"
+  # PENTING: kalau tidak ada backend isolasi yang tersedia, TOLAK menjalankan
+  # test buatan AI (bukan diam-diam jalan tanpa proteksi). Cek dulu dengan
+  # `python -m looper.cli --doctor` -- exit 5 artinya host ini tidak aman.
+  # Set false hanya kalau Anda sadar menerima risikonya. ADR-008.
+  sandbox_fail_closed: true
+  # single_file -> satu src/generated_code.py (default, perilaku lama).
+  # package     -> builder boleh mengeluarkan pohon multi-file lewat penanda
+  #                "### FILE: path". Path lewat allowlist, jumlah dibatasi. ADR-009.
+  artifact_mode: "single_file"
+  max_files_per_build: 25
+  # Rekam tiap build ke git supaya hasilnya bisa direview pakai `git diff`. ADR-010.
+  git:
+    enabled: false
+    branch_prefix: "looper/"
+    commit_per_cycle: true
+    author_name: "looper"
+    author_email: "looper@localhost"
   # Lint kode hasil AI sebelum diterima: py_compile (default) / flake8 / off.
   lint_generated: "py_compile"
 

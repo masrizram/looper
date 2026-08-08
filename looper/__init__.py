@@ -11,7 +11,7 @@ from looper.phases import PhaseManager, PhaseResult
 from looper.scoring import ScoringEngine
 from looper.state import StateManager
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = [
     "AgentSpec",

@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from looper.adequacy import evaluate_suite
+from looper.artifact import parse_multifile, primary_module, verify_python_files
 from looper.config import LooperConfig
 from looper.llm import AgentReply, OpenRouterClient
 from looper.prompts import PromptGenerator
-from looper.sandbox import run_sandboxed, scan_for_dangerous_calls
+from looper.sandbox import SandboxUnavailableError, run_sandboxed, scan_for_dangerous_calls
 from looper.scoring import NO_ISSUES_MARKERS, parse_security_findings
 from looper.state import StateManager
 from looper.testparse import parse_test_summary
@@ -287,12 +288,17 @@ class PhaseManager:
 
     async def run_build(self, goal: str) -> PhaseResult:
         architecture = self.read_file(DESIGN_FILE)
+        package_mode = self.config.execution.artifact_mode == "package"
         reply, result = await self._run_agent_phase(
             phase="build",
             agent_key="builder",
-            prompt=self.prompts.build(goal, architecture),
+            prompt=self.prompts.build(goal, architecture, package_mode=package_mode),
             output_file=CODE_FILE,
         )
+        if package_mode:
+            packaged = self._persist_package(reply)
+            if packaged is not None:
+                return replace_result(result, **packaged)
         build_ok, note = self._verify_syntax(reply)
         summary = "Code generated" if build_ok else (note or result.summary)
         if reply.ok and not build_ok:
@@ -316,6 +322,61 @@ class PhaseManager:
             build_ok=build_ok,
             summary=summary,
         )
+
+    def _persist_package(self, reply: AgentReply) -> dict[str, Any] | None:
+        """Write a multi-file artifact tree. ``None`` == not package output.
+
+        Returning ``None`` (no ``### FILE:`` markers, or a failed reply) lets
+        ``run_build`` fall back to the single-file path, so enabling package
+        mode can never make a previously-working build stop producing code.
+        """
+        if reply.failed:
+            return None
+        files = parse_multifile(reply.text, max_files=self.config.execution.max_files_per_build)
+        if not files:
+            return None
+
+        written: list[str] = []
+        for artifact in files:
+            try:
+                written.append(self.write_file(artifact.path, artifact.content))
+            except WorkspaceEscapeError:
+                logger.error("Package file escapes workspace, refused: %s", artifact.path)
+                self.state.record_error(f"build: refused path {artifact.path}")
+                return {
+                    "build_ok": False,
+                    "summary": f"refused unsafe artifact path {artifact.path}",
+                }
+
+        ok, note = verify_python_files(files)
+        if not ok:
+            self.state.record_error(f"build: {note}")
+            self.state.save()
+            return {"build_ok": False, "summary": note, "files_created": tuple(written)}
+
+        # The reviewer and security agents read CODE_FILE; give them every
+        # module, otherwise vulnerabilities outside the first file go unaudited.
+        self.write_file(CODE_FILE, primary_module(files))
+
+        for artifact in files:
+            if not artifact.is_python:
+                continue
+            lint_ok, lint_note = self._lint_generated(artifact.path)
+            if not lint_ok:
+                self.state.record_error(f"build: {lint_note}")
+                self.state.save()
+                return {
+                    "build_ok": False,
+                    "summary": lint_note,
+                    "files_created": tuple(written),
+                }
+
+        self.state.save()
+        return {
+            "build_ok": True,
+            "summary": f"Package generated: {len(files)} files",
+            "files_created": tuple(written),
+        }
 
     def _lint_generated(self, relative_path: str) -> tuple[bool, str]:
         """Compile/lint generated code before it is accepted.
@@ -484,6 +545,10 @@ class PhaseManager:
                     cpu_seconds=exec_cfg.sandbox_cpu_seconds,
                     wall_seconds=exec_cfg.sandbox_wall_seconds,
                     rss_bytes=exec_cfg.sandbox_rss_bytes,
+                    backend=exec_cfg.sandbox_backend,
+                    image=exec_cfg.sandbox_image,
+                    network=exec_cfg.sandbox_network,
+                    fail_closed=exec_cfg.sandbox_fail_closed,
                 )
             else:
                 proc = await asyncio.to_thread(
@@ -498,6 +563,11 @@ class PhaseManager:
         except subprocess.TimeoutExpired:
             logger.error("Test suite timed out after %ss", timeout)
             return 0, 1, f"timed out after {timeout}s"
+        except SandboxUnavailableError as exc:
+            # Fail closed: no isolation means the suite does not run, and the
+            # build loses the test weight rather than gaining it unverified.
+            logger.error("Refusing to run generated tests unsandboxed: %s", exc)
+            return 0, 1, f"sandbox unavailable: {exc}"
         except OSError as exc:
             logger.exception("Could not spawn the test subprocess")
             return 0, 1, f"could not run tests: {exc}"

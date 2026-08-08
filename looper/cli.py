@@ -8,11 +8,19 @@ import json
 import logging
 import signal
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from looper import __version__
-from looper.config import ConfigError, CostBudgetExceeded, load_config_with_dir
+from looper.config import ConfigError, CostBudgetExceeded, LooperConfig, load_config_with_dir
 from looper.orchestrator import LooperDaemon
+from looper.sandbox import (
+    SandboxUnavailableError,
+    docker_available,
+    posix_rlimits_available,
+    resolve_backend,
+)
+from looper.vcs import GitRepo
 
 logger = logging.getLogger("looper.cli")
 
@@ -20,6 +28,7 @@ EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
 EXIT_BUILD_BELOW_MINIMUM = 3
 EXIT_COST_EXCEEDED = 4
+EXIT_SANDBOX_UNAVAILABLE = 5
 EXIT_INTERRUPTED = 130
 
 
@@ -62,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--daemon", action="store_true", help="Run continuously (24/7)")
     parser.add_argument("--reset", action="store_true", help="Reset persisted state and exit")
     parser.add_argument("--check-config", action="store_true", help="Validate config and exit")
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Report which sandbox/git capabilities this host actually provides, and exit",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -106,6 +120,49 @@ async def _run_daemon(daemon: LooperDaemon) -> int:
     return EXIT_OK
 
 
+def run_doctor(config: LooperConfig) -> int:
+    """Print the isolation guarantees this host can actually deliver.
+
+    The point is to make a weak host *visible before* a build runs: the old
+    behaviour silently downgraded to no sandbox on Windows while the docs
+    promised resource limits. Exits non-zero when the configured policy cannot
+    be satisfied, so CI can gate on it.
+    """
+    execution = config.execution
+    docker = docker_available()
+    rlimits = posix_rlimits_available()
+    git_ok = GitRepo(Path(config.workspace)).available()
+
+    logger.info("looper %s doctor", __version__)
+    logger.info("  platform            : %s", sys.platform)
+    logger.info("  docker daemon       : %s", "yes" if docker else "no")
+    logger.info("  POSIX rlimits       : %s", "yes" if rlimits else "no")
+    logger.info("  git binary          : %s", "yes" if git_ok else "no")
+    logger.info("  sandbox_backend     : %s", execution.sandbox_backend)
+    logger.info("  sandbox_fail_closed : %s", execution.sandbox_fail_closed)
+    logger.info("  artifact_mode       : %s", execution.artifact_mode)
+    logger.info("  git_enabled         : %s", execution.git_enabled)
+
+    if not execution.sandbox_tests:
+        logger.warning("sandbox_tests is off: LLM-authored tests run unconfined")
+        return EXIT_OK
+    try:
+        effective = resolve_backend(
+            execution.sandbox_backend, fail_closed=execution.sandbox_fail_closed
+        )
+    except SandboxUnavailableError as exc:
+        logger.error("SANDBOX UNAVAILABLE: %s", exc)
+        logger.error("Builds will refuse to run generated tests. Install Docker or set")
+        logger.error("execution.sandbox_fail_closed: false to accept the risk explicitly.")
+        return EXIT_SANDBOX_UNAVAILABLE
+    logger.info("  effective sandbox   : %s", effective)
+    if effective == "none":
+        logger.warning("No isolation in effect; generated tests run on the host")
+    if execution.git_enabled and not git_ok:
+        logger.warning("git_enabled is true but no git binary was found; commits will be skipped")
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -126,6 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             len(config.agents),
         )
         return EXIT_OK
+
+    if args.doctor:
+        return run_doctor(config)
 
     daemon = LooperDaemon(config, config_dir=config_dir)
 

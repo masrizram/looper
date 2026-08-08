@@ -4,8 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "looper"
-version = "2.0.0"
-description = "Autonomous multi-agent software build pipeline"
+version = "2.1.0"
+description = "A release gate for AI-written code: multi-agent build loop with fail-closed scoring, hard USD budget, and sandboxed test execution"
+authors = [{ name = "masrizram" }]
+keywords = ["llm", "agents", "ai", "code-generation", "sandbox", "ci", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Security",
+]
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -27,6 +38,12 @@ dev = [
     "bandit>=1.7",
     "pip-audit>=2.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/masrizram/looper"
+Repository = "https://github.com/masrizram/looper"
+Issues = "https://github.com/masrizram/looper/issues"
+Changelog = "https://github.com/masrizram/looper/blob/main/CHANGELOG.md"
 
 [project.scripts]
 looper = "looper.cli:main"

@@ -622,7 +622,12 @@ def test_user_tests_failure_is_propagated(tmp_path, raw_config):
         encoding="utf-8",
     )
     config = build_config(
-        {**raw_config, "execution": {"user_tests_dir": str(user_dir)}},
+        {
+            **raw_config,
+            # These tests exercise the user-suite plumbing by really running
+            # pytest on the host, so they opt out of isolation explicitly.
+            "execution": {"user_tests_dir": str(user_dir), "sandbox_tests": False},
+        },
         env={},
     )
     phases = build_phases(
@@ -645,7 +650,10 @@ def test_relative_user_tests_dir_is_resolved_against_config_dir(tmp_path, raw_co
         encoding="utf-8",
     )
     config = build_config(
-        {**raw_config, "execution": {"user_tests_dir": "user_tests"}},
+        {
+            **raw_config,
+            "execution": {"user_tests_dir": "user_tests", "sandbox_tests": False},
+        },
         env={},
     )
     phases = build_phases(
@@ -688,7 +696,12 @@ def test_user_tests_run_when_configured(tmp_path, raw_config):
         encoding="utf-8",
     )
     config = build_config(
-        {**raw_config, "execution": {"user_tests_dir": str(user_dir)}},
+        {
+            **raw_config,
+            # These tests exercise the user-suite plumbing by really running
+            # pytest on the host, so they opt out of isolation explicitly.
+            "execution": {"user_tests_dir": str(user_dir), "sandbox_tests": False},
+        },
         env={},
     )
     phases = build_phases(

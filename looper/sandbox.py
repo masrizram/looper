@@ -103,6 +103,140 @@ def scan_for_dangerous_calls(source: str) -> list[str]:
     return reasons
 
 
+class SandboxUnavailableError(RuntimeError):
+    """No isolation backend is available and the policy is fail-closed.
+
+    Raised instead of silently executing LLM-authored code unconfined. The
+    previous behaviour degraded to a bare ``subprocess.run`` on any platform
+    without ``fork`` (i.e. every Windows host) while the documentation still
+    promised resource limits -- the one fail-*open* path in an otherwise
+    fail-closed system. See ADR-008.
+    """
+
+
+#: Accepted values for ``execution.sandbox_backend``.
+SANDBOX_BACKENDS: tuple[str, ...] = ("auto", "rlimit", "docker", "none")
+
+#: Effective backends ``resolve_backend`` may return.
+EFFECTIVE_BACKENDS: tuple[str, ...] = ("rlimit", "docker", "none")
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
+def posix_rlimits_available() -> bool:
+    """True when ``preexec_fn`` + ``resource`` rlimits can be installed."""
+    return hasattr(os, "fork")
+
+
+def docker_available(runner: Runner | None = None) -> bool:
+    """True when a responsive Docker daemon can be reached.
+
+    ``docker version`` is used rather than ``docker --version`` because the
+    latter succeeds even when the daemon is down, which would let us claim
+    container isolation we cannot actually provide.
+    """
+    run = runner or subprocess.run
+    try:
+        proc = run(  # nosec B603 B607 - fixed argv, no shell
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def resolve_backend(
+    requested: str,
+    *,
+    fail_closed: bool = True,
+    runner: Runner | None = None,
+) -> str:
+    """Pick the effective isolation backend, or refuse.
+
+    ``auto`` prefers Docker (equivalent isolation on every OS), then POSIX
+    rlimits. When nothing is available the decision is the caller's policy:
+    ``fail_closed=True`` raises :class:`SandboxUnavailableError` so untrusted
+    code is never run unconfined, ``False`` degrades to ``none`` with a loud
+    warning.
+    """
+    if requested not in SANDBOX_BACKENDS:
+        raise ValueError(f"unknown sandbox backend {requested!r}; expected {SANDBOX_BACKENDS}")
+
+    if requested == "none":
+        logger.warning(
+            "sandbox_backend='none': LLM-authored tests will run unconfined on this host"
+        )
+        return "none"
+
+    if requested == "docker":
+        if docker_available(runner):
+            return "docker"
+        return _unavailable("docker backend requested but no Docker daemon responded", fail_closed)
+
+    if requested == "rlimit":
+        if posix_rlimits_available():
+            return "rlimit"
+        return _unavailable(
+            "rlimit backend requested but this platform has no fork/rlimits", fail_closed
+        )
+
+    # auto
+    if docker_available(runner):
+        return "docker"
+    if posix_rlimits_available():
+        return "rlimit"
+    return _unavailable(
+        "no sandbox backend available (no Docker daemon, no POSIX rlimits)", fail_closed
+    )
+
+
+def _unavailable(message: str, fail_closed: bool) -> str:
+    if fail_closed:
+        raise SandboxUnavailableError(message)
+    logger.warning("%s; running WITHOUT isolation because sandbox_fail_closed is false", message)
+    return "none"
+
+
+def docker_argv(
+    argv: list[str],
+    *,
+    cwd: str,
+    image: str,
+    network: str,
+    cpu_seconds: int,
+    rss_bytes: int,
+) -> list[str]:
+    """Wrap ``argv`` so it runs inside a throwaway, network-isolated container.
+
+    The host interpreter path in ``argv[0]`` is meaningless inside the image,
+    so it is replaced with the container's ``python``. The workspace is the
+    only thing mounted, which also contains the filesystem blast radius.
+    """
+    return [
+        "docker",
+        "run",
+        "--rm",
+        f"--network={network}",
+        f"--cpus={max(1, cpu_seconds // 60) if cpu_seconds >= 60 else 1}",
+        f"--memory={max(64_000_000, rss_bytes)}b",
+        "--pids-limit=256",
+        "--read-only",
+        "--tmpfs=/tmp:rw,size=64m",  # nosec B108 - container-internal tmpfs, not a host path
+        "--security-opt=no-new-privileges",
+        "-v",
+        f"{cwd}:/work",
+        "-w",
+        "/work",
+        image,
+        "python",
+        *argv[1:],
+    ]
+
+
 def run_sandboxed(
     argv: list[str],
     *,
@@ -111,19 +245,46 @@ def run_sandboxed(
     cpu_seconds: int,
     wall_seconds: int,
     rss_bytes: int,
+    backend: str = "auto",
+    image: str = "python:3.11-slim",
+    network: str = "none",
+    fail_closed: bool = True,
+    runner: Runner | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run ``argv`` (fixed, never shell) under resource limits.
+    """Run ``argv`` (fixed, never shell) under the strongest isolation available.
 
-    On POSIX a ``preexec_fn`` installs RLIMIT_CPU / RLIMIT_AS so a runaway
-    generated suite is killed instead of wedging the daemon or OOMing the box.
-    On Windows (no ``fork``/rlimits) we fall back to the wall-clock
-    ``timeout`` alone and log the weaker guarantee.
+    * ``docker`` -- throwaway read-only container, no network, cpu/memory/pids
+      capped. Identical guarantees on Linux, macOS and Windows.
+    * ``rlimit`` -- POSIX ``preexec_fn`` installing RLIMIT_CPU / RLIMIT_AS.
+    * ``none``   -- no isolation; only reachable when the caller explicitly
+      opted out or set ``fail_closed=False``.
+
+    Raises :class:`SandboxUnavailableError` when isolation was required but
+    could not be provided.
     """
-    preexec = (
-        _posix_rlimit_fn(cpu_seconds, wall_seconds, rss_bytes) if hasattr(os, "fork") else None
-    )
+    run = runner or subprocess.run
+    effective = resolve_backend(backend, fail_closed=fail_closed, runner=runner)
 
-    return subprocess.run(  # nosec B603 - fixed argv, no shell
+    if effective == "docker":
+        return run(  # nosec B603 - fixed argv, no shell
+            docker_argv(
+                argv,
+                cwd=cwd,
+                image=image,
+                network=network,
+                cpu_seconds=cpu_seconds,
+                rss_bytes=rss_bytes,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    preexec = (
+        _posix_rlimit_fn(cpu_seconds, wall_seconds, rss_bytes) if effective == "rlimit" else None
+    )
+    return run(  # nosec B603 - fixed argv, no shell
         argv,
         capture_output=True,
         text=True,
