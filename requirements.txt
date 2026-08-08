@@ -1,6 +1,10 @@
-# Looper Daemon runtime dependencies.
-# Dev/CI tooling lives in the [project.optional-dependencies] "dev" extra
-# in pyproject.toml -- install with: pip install -e ".[dev]"
-openai>=1.30
-aiohttp>=3.9
-pyyaml>=6.0
+# Looper Daemon runtime dependencies — SINGLE SOURCE OF TRUTH.
+# Keep this in lock-step with [project].dependencies in pyproject.toml.
+# Installing: pip install -e .   (or: pip install -r requirements.txt)
+#
+# Pinning policy: a lower bound for compatibility and an upper bound (<next
+# major) so a breaking release cannot silently break a pinned deployment.
+# The code is exercised against openai 2.x, aiohttp 3.14.x, pyyaml 6.0.x.
+openai>=1.30,<3.0
+aiohttp>=3.9,<4.0
+pyyaml>=6.0,<7.0

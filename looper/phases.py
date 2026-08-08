@@ -33,15 +33,23 @@ REVIEW_FILE = "review.md"
 SECURITY_FILE = "security_audit.md"
 DOCS_FILE = "docs/README.md"
 
-#: Agents habitually wrap code in ```python fences. Parsing the fenced text as
-#: Python would always raise, so the fences are stripped before the check.
-_FENCE_RE = re.compile(r"^\s*```[^\n]*\n(.*?)\n?```\s*$", re.DOTALL)
+#: Agents habitually wrap code in ```python fences, and often prefix the
+#: block with prose ("Here is the code:"). Parsing the fenced text as Python
+#: would always raise, so the first fenced block's body is extracted; if there
+#: is no fence the text is returned unchanged (the builder may emit bare code).
+_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 
 
 def strip_code_fences(text: str) -> str:
-    """Return the body of a single fenced block, or ``text`` unchanged."""
-    match = _FENCE_RE.match(text or "")
-    return match.group(1) if match else (text or "")
+    """Return the body of the first fenced block, or ``text`` unchanged.
+
+    A non-anchored search (not ``match``) is deliberate: a reply such as
+    "Here is the code:\\n```python\\nx = 1\\n```" must yield ``x = 1``, not the
+    whole fenced string, otherwise ``ast.parse`` rejects valid code and the
+    build fails closed for no reason.
+    """
+    match = _FENCE_RE.search(text or "")
+    return match.group(1).strip() if match else (text or "")
 
 
 class WorkspaceEscapeError(ValueError):

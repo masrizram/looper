@@ -165,6 +165,15 @@ def test_build_accepts_fenced_code(config):
     assert result.summary == "Code generated"
 
 
+def test_build_strips_prose_prefix_before_fence(config):
+    """A reply of prose + a fenced block must yield valid code, not the whole
+    fenced string (which would fail ast.parse and fail the build closed)."""
+    reply_text = "Here is the complete module:\n```python\nx = 1\nprint(x)\n```\n"
+    phases = build_phases(config, replies={**DEFAULT_REPLIES, "Code Builder": reply_text})
+    result = asyncio.run(phases.run_build("goal"))
+    assert result.build_ok is True
+
+
 def test_fix_with_unparseable_output_does_not_set_build_ok(config):
     phases = build_phases(config, replies={**DEFAULT_REPLIES, "Expert Fixer": "still broken(:"})
     result = asyncio.run(phases.run_fix("goal", ["HIGH: something"]))

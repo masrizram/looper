@@ -52,13 +52,13 @@ goal ──> ┌─────────────── cycle 1 ───�
 | Phase | Agent | Produces |
 |---|---|---|
 | `research` | Researcher | `research.md` |
-| `architecture` | Architect + UX/API Designer | `design.md` |
+| `architecture` | Architect + UX/API Designer | `architecture/design.md` |
 | `build` | Code Builder | `generated_code.py` |
 | `test` | Test Generator | `test_generated.py`, then runs pytest |
 | `review` | Senior Reviewer | `review.md` + a 0–100 score |
 | `security_audit` | Security Auditor | `security_audit.md` + findings |
 | `performance_optimize` | Optimizer | `optimized_code.py` |
-| `documentation` | Doc Writer | `README_generated.md` |
+| `documentation` | Doc Writer | `docs/README.md` |
 | `fix` | Expert Fixer | patched code, promoted to canonical |
 
 Phase lists are configurable — see the commented block in `config.yaml`.
@@ -115,7 +115,8 @@ curl -X POST localhost:9999/build \
 ```
 
 Protections: constant-time token comparison, per-IP rate limiting, request body
-and goal length caps, and a startup **refusal** to bind `0.0.0.0` without a token.
+and goal length caps, and a startup **refusal** to bind *any* non-loopback address
+(`0.0.0.0`, `::`, or a LAN address) without a token.
 
 ### Resilience & cost control
 
@@ -149,6 +150,7 @@ python -m looper.cli --check-config
 
 | Flag | Effect |
 |---|---|
+| `--version` | Print version and exit |
 | `--goal "..."` | Run one build, exit non-zero if below `min_acceptable` |
 | `--daemon` | Run HTTP server + file watcher until signalled |
 | `--check-config` | Validate config and exit |
@@ -157,7 +159,7 @@ python -m looper.cli --check-config
 | `--json-logs` | Structured JSON logs for log shippers |
 | `--log-level` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
-Exit codes: `0` ok · `1` config error · `2` build below minimum.
+Exit codes: `0` ok · `2` config error · `3` build below minimum · `130` interrupted.
 
 ---
 

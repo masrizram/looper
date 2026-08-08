@@ -21,7 +21,8 @@ watch_interval: 2.0
 # --- HTTP API server ---------------------------------------------------------
 # PERINGATAN: POST /build memicu eksekusi kode buatan LLM. Perlakukan endpoint
 # ini sebagai remote code execution. Default bind 127.0.0.1 (localhost saja).
-# Bind ke 0.0.0.0 TANPA auth token akan DITOLAK saat startup (bukan cuma warning).
+# Bind APA PUN selain loopback (0.0.0.0, ::, atau alamat LAN) TANPA auth
+# token akan DITOLAK saat startup (bukan cuma warning). Lihat ADR-004.
 http:
   bind: "127.0.0.1"
   port: 9999

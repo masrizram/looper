@@ -39,6 +39,9 @@ py-modules = ["daemon"]
 testpaths = ["tests"]
 addopts = "-ra -q --strict-markers --strict-config"
 filterwarnings = ["error"]
+markers = [
+    "integration: exercises real external boundaries (sockets, network) and is skipped when those are unavailable",
+]
 
 [tool.coverage.run]
 branch = true

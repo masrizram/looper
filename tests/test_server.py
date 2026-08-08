@@ -366,3 +366,66 @@ def test_real_aiohttp_module_is_used_when_available():
     from aiohttp import web as real_web
 
     assert server._web is real_web
+
+
+@pytest.mark.integration
+def test_real_aiohttp_endpoints_over_loopback():
+    """Behavioural cover the in-memory fakes cannot give: the real aiohttp
+    request/response lifecycle actually binds a socket and serves /health,
+    /build auth, and /metrics. Skips silently if aiohttp is absent."""
+    aiohttp = pytest.importorskip("aiohttp")
+
+    async def run():
+        seen = []
+
+        async def capture(goal):
+            seen.append(goal)
+
+        token = "secret-token"
+        # Bind to 127.0.0.1 only; let the OS assign an ephemeral port at the
+        # TCPSite layer (HTTPConfig still validates the default port 9999).
+        config = HTTPConfig(bind="127.0.0.1", auth_token=token)
+        server = HTTPServer(config, capture, web_module=None)
+        runner = aiohttp.web.AppRunner(server.build_app())
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, config.bind, 0)
+        await site.start()
+        actual_port = site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{actual_port}"
+
+        headers_auth = {"Authorization": f"Bearer {token}"}
+
+        # /health is unauthenticated.
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(f"{base}/health") as resp:
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["status"] == "ok"
+
+            # /build with a valid token is accepted (202-free 200 + started).
+            async with sess.post(
+                f"{base}/build",
+                json={"goal": "build a thing"},
+                headers=headers_auth,
+            ) as resp:
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["status"] == "started"
+
+            # /build without a token is rejected.
+            async with sess.post(f"{base}/build", json={"goal": "x"}) as resp:
+                assert resp.status == 401
+
+            # /metrics requires auth.
+            async with sess.get(f"{base}/metrics") as resp:
+                assert resp.status == 401
+            async with sess.get(f"{base}/metrics", headers=headers_auth) as resp:
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["build_accepted"] == 1
+
+        await runner.cleanup()
+        return seen
+
+    saw = asyncio.run(run())
+    assert saw == ["build a thing"]
