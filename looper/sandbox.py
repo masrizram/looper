@@ -17,6 +17,9 @@ import ast
 import logging
 import os
 import subprocess  # nosec B404 - used with a fixed argv, never shell=True
+import tokenize
+from io import StringIO
+from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger("looper.sandbox")
@@ -27,10 +30,12 @@ logger = logging.getLogger("looper.sandbox")
 #: and "# a comment about os.system" is stripped before scanning.
 DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("os.system", "shell execution via os.system"),
+    ("os.popen", "shell execution via os.popen"),
     ("os.remove", "filesystem deletion via os.remove"),
     ("os.unlink", "filesystem deletion via os.unlink"),
     ("os.rmdir", "filesystem deletion via os.rmdir"),
     ("shutil.rmtree", "recursive filesystem deletion via shutil.rmtree"),
+    ("shutil.move", "filesystem move via shutil.move"),
     ("os.rename", "filesystem move via os.rename"),
     ("subprocess.run", "child process spawn via subprocess.run"),
     ("subprocess.Popen", "child process spawn via subprocess.Popen"),
@@ -49,14 +54,110 @@ DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("ctypes", "native code via ctypes"),
 )
 
+#: Fully-qualified call targets refused by the AST pass. Matching the dotted
+#: path rather than the bare attribute name is what stops ``json.loads`` (a
+#: staple of ordinary tests) being reported as "dangerous builtin 'loads'"
+#: while ``os.popen`` sailed through untouched.
+DANGEROUS_CALL_PATHS: frozenset[str] = frozenset(
+    {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "breakpoint",
+        "os.system",
+        "os.popen",
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.removedirs",
+        "os.rename",
+        "os.replace",
+        "os.truncate",
+        "os.fork",
+        "os.forkpty",
+        "os.kill",
+        "os.killpg",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.spawnv",
+        "os.putenv",
+        "shutil.rmtree",
+        "shutil.move",
+        "shutil.copytree",
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.getoutput",
+        "pickle.load",
+        "pickle.loads",
+        "marshal.load",
+        "marshal.loads",
+        "socket.socket",
+        "socket.create_connection",
+        "requests.get",
+        "requests.post",
+        "requests.request",
+        "httpx.get",
+        "httpx.post",
+        "urllib.request.urlopen",
+        "ctypes.CDLL",
+        "ctypes.WinDLL",
+    }
+)
+
+#: Method names that write or delete through an object we cannot resolve
+#: statically (``Path(x).write_text``, ``open(...).write``). Flagged on the
+#: attribute alone because the receiver is unknowable at scan time.
+DANGEROUS_METHOD_NAMES: frozenset[str] = frozenset(
+    {
+        "write_text",
+        "write_bytes",
+        "unlink",
+        "rmdir",
+        "mkdir",
+        "touch",
+        "symlink_to",
+        "hardlink_to",
+        "chmod",
+    }
+)
+
 
 def _strip_comments(source: str) -> str:
-    """Drop ``#``-to-end-of-line comments so prose mentions aren't flagged.
+    """Drop comments using the tokenizer, keeping string literals intact.
 
-    Strings are left intact; a ``#`` inside a string is rare in guardrail code
-    and keeping it only makes the scan stricter, which is safe here.
+    A naive ``line.split("#", 1)[0]`` also truncated at a ``#`` inside a
+    string, so ``url = "http://x/#f"; os.system(cmd)`` lost the dangerous
+    call and scanned clean -- looser, not stricter, than advertised. On a
+    tokenize error (the suite may not even be valid Python) the original
+    source is returned so the substring pass still sees everything.
     """
-    return "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+    try:
+        tokens = list(tokenize.generate_tokens(StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return source
+    kept = [tok for tok in tokens if tok.type != tokenize.COMMENT]
+    try:
+        return tokenize.untokenize(kept)
+    except (ValueError, IndentationError):  # pragma: no cover - defensive
+        return source
+
+
+def _dotted_name(func: ast.expr) -> str:
+    """Return the dotted call target, e.g. ``os.path.join``, or ``""``."""
+    parts: list[str] = []
+    node: ast.expr | None = func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return ""
 
 
 def scan_for_dangerous_calls(source: str) -> list[str]:
@@ -65,42 +166,46 @@ def scan_for_dangerous_calls(source: str) -> list[str]:
     An empty list means "looks ok". Comments are stripped first; bare imports
     of a dangerous module (e.g. ``import subprocess``) are not enough on their
     own because the ambiguous fragments require the call form (``.run``, etc.).
-    An AST pass adds detection of dangerous *calls* that the substring scan
-    could miss (e.g. ``getattr(os, "system")``).
+    An AST pass adds detection of dangerous *calls* by fully-qualified name,
+    so ordinary helpers such as ``json.loads`` are not swept up with them.
+
+    This is a tripwire, not a perimeter: string concatenation and ``getattr``
+    indirection defeat any static scan. Real containment comes from the
+    container/rlimit backend in :func:`run_sandboxed`.
     """
     reasons: list[str] = []
     scanned = _strip_comments(source)
     for fragment, reason in DESTRUCTIVE_PATTERNS:
         if fragment in scanned:
             reasons.append(reason)
-    # AST pass: only flag dangerous names that are actually *called*.
+
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return reasons
-    called: set[str] = set()
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Name):
-                called.add(func.id)
-            elif isinstance(func, ast.Attribute):
-                called.add(func.attr)
-    dangerous_calls = {
-        "system",
-        "remove",
-        "unlink",
-        "rmdir",
-        "rename",
-        "fork",
-        "kill",
-        "eval",
-        "exec",
-        "loads",
-    }
-    for name in called & dangerous_calls:
-        reasons.append(f"calls dangerous builtin/function '{name}'")
-    return reasons
+        if not isinstance(node, ast.Call):
+            continue
+        dotted = _dotted_name(node.func)
+        if dotted in DANGEROUS_CALL_PATHS:
+            reasons.append(f"calls dangerous function '{dotted}'")
+            continue
+        # getattr(os, "system") style indirection.
+        if dotted == "getattr":
+            reasons.append("dynamic attribute lookup via getattr")
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr in DANGEROUS_METHOD_NAMES:
+            reasons.append(f"calls filesystem-mutating method '{node.func.attr}'")
+
+    # Deduplicate while preserving order: one reason per distinct problem.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for reason in reasons:
+        if reason not in seen:
+            seen.add(reason)
+            unique.append(reason)
+    return unique
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -132,17 +237,17 @@ def posix_rlimits_available() -> bool:
     return hasattr(os, "fork")
 
 
-def docker_available(runner: Runner | None = None) -> bool:
+def docker_available(runner: Runner | None = None, *, timeout: float = 5.0) -> bool:
     """True when a responsive Docker daemon can be reached.
 
     ``docker version`` is used rather than ``docker --version`` because the
     latter succeeds even when the daemon is down, which would let us claim
     container isolation we cannot actually provide.
     """
-    return _docker_probe("docker", runner)
+    return _docker_probe("docker", runner, timeout=timeout)
 
 
-def podman_available(runner: Runner | None = None) -> bool:
+def podman_available(runner: Runner | None = None, *, timeout: float = 5.0) -> bool:
     """True when a running Podman machine (and the ``podman`` binary) exists.
 
     Podman is a drop-in for Docker for the ``run`` call, but its ``version``
@@ -151,16 +256,20 @@ def podman_available(runner: Runner | None = None) -> bool:
     (which reaches the machine/VM) and treat anything that does not confirm a
     live runtime as "not available" rather than "isolation ready".
     """
-    return _docker_probe("podman", runner, info=True)
+    return _docker_probe("podman", runner, info=True, timeout=timeout)
 
 
-def _docker_probe(binary: str, runner: Runner | None, *, info: bool = False) -> bool:
+def _docker_probe(
+    binary: str, runner: Runner | None, *, info: bool = False, timeout: float = 5.0
+) -> bool:
     """Probe a Docker-compatible runtime for a *responsive* daemon/machine.
 
     For Docker the canonical probe is ``<bin> version`` (server component).
     For Podman we use ``<bin> info``, because ``podman version`` reports the
     client version and exits 0 even with no machine booted. Either probe must
-    return a clean exit code, or we report no isolation.
+    return a clean exit code, or we report no isolation. The timeout is short
+    on purpose: ``--doctor`` probes both runtimes, and a 15s hang each made a
+    host with neither installed sit silent for half a minute.
     """
     run = runner or subprocess.run
     argv = [binary, "info"] if info else [binary, "version", "--format", "{{.Server.Version}}"]
@@ -169,7 +278,7 @@ def _docker_probe(binary: str, runner: Runner | None, *, info: bool = False) -> 
             argv,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -253,6 +362,31 @@ def _unavailable(message: str, fail_closed: bool) -> str:
     return "none"
 
 
+def to_container_path(value: str, cwd: str) -> str:
+    """Rewrite a host path that lives under ``cwd`` into its ``/work`` form.
+
+    ``argv`` carries the absolute host path of the tests directory. Inside the
+    image only ``/work`` exists, so passing ``C:\\ws\\tests`` (or
+    ``/home/u/ws/tests``) made pytest exit non-zero every single time -- the
+    container backend, the only real isolation on Windows/macOS and the whole
+    of ADR-008, could never once succeed. Values outside ``cwd`` are returned
+    unchanged; the caller is responsible for refusing those.
+    """
+    host_root = str(Path(cwd))
+    try:
+        candidate = Path(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return value
+    if not candidate.is_absolute():
+        return value
+    try:
+        relative = candidate.relative_to(host_root)
+    except ValueError:
+        return value
+    tail = relative.as_posix()
+    return "/work" if tail in ("", ".") else f"/work/{tail}"
+
+
 def docker_argv(
     argv: list[str],
     *,
@@ -266,11 +400,15 @@ def docker_argv(
     """Wrap ``argv`` so it runs inside a throwaway, network-isolated container.
 
     The host interpreter path in ``argv[0]`` is meaningless inside the image,
-    so it is replaced with the container's ``python``. The workspace is the
-    only thing mounted, which also contains the filesystem blast radius.
-    ``runtime`` is the resolved binary (``docker`` or ``podman``); both share
-    this exact ``run`` contract (read-only, no network, capped cpu/mem/pids).
+    so it is replaced with the container's ``python``. Every remaining
+    argument that points inside the workspace is rewritten to its ``/work``
+    equivalent, because the workspace is bind-mounted there and the host path
+    does not exist in the image. The workspace is the only thing mounted,
+    which also contains the filesystem blast radius. ``runtime`` is the
+    resolved binary (``docker`` or ``podman``); both share this exact ``run``
+    contract (read-only, no network, capped cpu/mem/pids).
     """
+    inner = [to_container_path(arg, cwd) for arg in argv[1:]]
     return [
         runtime,
         "run",
@@ -288,7 +426,7 @@ def docker_argv(
         "/work",
         image,
         "python",
-        *argv[1:],
+        *inner,
     ]
 
 
@@ -355,10 +493,19 @@ def run_sandboxed(
     )
 
 
-def _posix_rlimit_fn(  # pragma: no cover - POSIX-only
-    cpu_seconds: int, wall_seconds: int, rss_bytes: int
-) -> "Callable[[], None]":
-    """Build a ``preexec_fn`` that installs CPU/AS rlimits (POSIX assumes fork)."""
+def _posix_rlimit_fn(cpu_seconds: int, wall_seconds: int, rss_bytes: int) -> "Callable[[], None]":
+    """Build a ``preexec_fn`` that installs CPU/AS rlimits (POSIX assumes fork).
+
+    Three bugs lived here and were invisible because the function carried a
+    ``# pragma: no cover``:
+
+    * ``setrlimit`` was passed a bare int where the API requires a
+      ``(soft, hard)`` tuple -- a guaranteed ``TypeError`` inside the child;
+    * the error-handling helper ``_set`` was defined but never called;
+    * a final ``RLIMIT_CPU`` write with ``wall_seconds`` silently overwrote
+      the real CPU cap. RLIMIT_CPU never bounded wall clock anyway -- the
+      subprocess ``timeout`` does that, so ``wall_seconds`` is not an rlimit.
+    """
     import resource
 
     def _preexec() -> None:
@@ -368,15 +515,15 @@ def _posix_rlimit_fn(  # pragma: no cover - POSIX-only
             except (ValueError, OSError) as exc:
                 logger.warning("Could not set rlimit %s: %s", limit, exc)
 
-        resource.setrlimit(  # type: ignore[attr-defined]
-            resource.RLIMIT_CPU, max(1, cpu_seconds)  # type: ignore[attr-defined]
-        )
-        resource.setrlimit(  # type: ignore[attr-defined]
-            resource.RLIMIT_AS, max(1, rss_bytes)  # type: ignore[attr-defined]
-        )
-        # RLIMIT_CPU only fires on wall-clock-ish CPU time; gate wall time too.
-        resource.setrlimit(  # type: ignore[attr-defined]
-            resource.RLIMIT_CPU, max(1, wall_seconds)  # type: ignore[attr-defined]
-        )
+        _set(resource.RLIMIT_CPU, max(1, cpu_seconds))  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_AS, max(1, rss_bytes))  # type: ignore[attr-defined]
+        # Fork bombs and runaway file writes are the other two ways generated
+        # code wedges a host; both are cheap to cap here.
+        nproc = getattr(resource, "RLIMIT_NPROC", None)
+        if nproc is not None:
+            _set(nproc, 64)
+        fsize = getattr(resource, "RLIMIT_FSIZE", None)
+        if fsize is not None:
+            _set(fsize, 64 * 1024 * 1024)
 
     return _preexec

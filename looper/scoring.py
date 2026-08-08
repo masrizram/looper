@@ -16,7 +16,29 @@ SECURITY_FINDING_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+#: Phrases an auditor uses to say "clean". Matched as a regex against the
+#: lowered report, because a literal-substring list of three English phrases
+#: reported "No security issues were identified" as a malformed report and
+#: injected a phantom MEDIUM finding -- the exact false-positive class this
+#: project refuses to ship.
+NO_ISSUES_RE = re.compile(
+    r"\bno\s+(?:known\s+|significant\s+|apparent\s+|obvious\s+)?"
+    r"(?:security\s+)?(?:issues?|vulnerabilit(?:y|ies)|findings?|concerns?|"
+    r"problems?|weaknesses)\b"
+    r"|\bnothing\s+(?:of\s+concern|to\s+report)\b"
+    r"|\b(?:issues?|vulnerabilit(?:y|ies)|findings?)\s*:\s*none\b"
+    r"|\bnone\s+(?:found|identified|detected|observed)\b",
+    re.IGNORECASE,
+)
+
+#: Kept for backwards compatibility with callers that iterate the markers.
 NO_ISSUES_MARKERS = ("no issues found", "no vulnerabilities found", "no findings")
+
+
+def reports_no_issues(text: str) -> bool:
+    """True when an auditor's prose declares the code clean."""
+    return bool(NO_ISSUES_RE.search(text or ""))
+
 
 SEVERITY_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 

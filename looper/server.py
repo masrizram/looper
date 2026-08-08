@@ -7,7 +7,7 @@ import hmac
 import json
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from typing import Any, Deque
 
@@ -24,31 +24,52 @@ class HTTPUnavailableError(RuntimeError):
 
 
 class RateLimiter:
-    """Fixed-window-per-client limiter.
+    """Fixed-window-per-client limiter with a bounded client table.
 
-    Keeps a bounded deque of hit timestamps per client and prunes on read, so
-    idle clients cost nothing and memory cannot grow without bound.
+    Keeps a deque of hit timestamps per client and prunes on read. The client
+    table itself is capped: an earlier version popped an empty bucket and
+    immediately recreated it via ``setdefault``, a no-op that left one dict
+    entry per IP forever. A scan of many source addresses is exactly the
+    traffic a public daemon sees, so the table is now evicted oldest-first.
     """
+
+    #: Hard ceiling on tracked clients. Well above any legitimate fan-in.
+    MAX_CLIENTS = 4096
 
     def __init__(self, limit_per_minute: int, window_seconds: float = 60.0) -> None:
         self.limit = limit_per_minute
         self.window = window_seconds
-        self._hits: dict[str, Deque[float]] = {}
+        self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
+
+    def _evict(self, cutoff: float) -> None:
+        """Drop clients whose most recent hit fell out of the window."""
+        for client in [c for c, bucket in self._hits.items() if not bucket or bucket[-1] <= cutoff]:
+            del self._hits[client]
 
     def allow(self, client: str, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now
-        bucket = self._hits.setdefault(client, deque())
         cutoff = current - self.window
+        self._evict(cutoff)
+        bucket = self._hits.get(client)
+        if bucket is None:
+            bucket = deque()
+            self._hits[client] = bucket
+        self._hits.move_to_end(client)
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
-        if not bucket:
-            # Drop empty buckets so a scan of many client IPs cannot leak memory.
-            self._hits.pop(client, None)
-            bucket = self._hits.setdefault(client, deque())
+        # Enforce the ceiling *after* inserting: evicting first let the table
+        # settle one entry above MAX_CLIENTS on every call.
+        while len(self._hits) > self.MAX_CLIENTS:
+            self._hits.popitem(last=False)
         if len(bucket) >= self.limit:
             return False
         bucket.append(current)
         return True
+
+    @property
+    def tracked_clients(self) -> int:
+        """Size of the client table - asserted by the memory-growth test."""
+        return len(self._hits)
 
     def reset(self) -> None:
         self._hits.clear()
@@ -129,10 +150,24 @@ class HTTPServer:
         # can measure response latency.
         return hmac.compare_digest(header, f"Bearer {self.config.auth_token}")
 
-    @staticmethod
-    def _client_id(request: Any) -> str:
+    def _client_id(self, request: Any) -> str:
+        """Identify the rate-limit bucket for ``request``.
+
+        ``X-Forwarded-For`` is honoured only when the immediate peer is a
+        configured trusted proxy. Believing it unconditionally would let any
+        caller forge a fresh identity per request and bypass the limit;
+        ignoring it entirely behind a real proxy would collapse every client
+        into one bucket. Both failure modes are worse than this check.
+        """
         remote = getattr(request, "remote", None)
-        return str(remote) if remote else "unknown"
+        peer = str(remote) if remote else "unknown"
+        if peer in self.config.trusted_proxies:
+            headers = getattr(request, "headers", {})
+            forwarded = headers.get("X-Forwarded-For", "") if headers else ""
+            if forwarded:
+                # Left-most entry is the original client per RFC 7239 usage.
+                return forwarded.split(",")[0].strip() or peer
+        return peer
 
     def _track(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(coro)

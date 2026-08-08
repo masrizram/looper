@@ -38,6 +38,9 @@ class StateManager:
         self.state_file = Path(state_file)
         self.max_history_entries = max_history_entries
         self.state: dict[str, Any] = self._load()
+        #: Cached JSON round-trip of ``state``. /status is polled far more
+        #: often than the state changes, and the round-trip is O(history).
+        self._snapshot_cache: dict[str, Any] | None = None
 
     def _load(self) -> dict[str, Any]:
         if self.state_file.exists():
@@ -85,6 +88,7 @@ class StateManager:
 
     def update(self, **kwargs: Any) -> None:
         self.state.update(kwargs)
+        self._snapshot_cache = None
 
     def append_history(self, entry: dict[str, Any]) -> None:
         history = list(self.state.get("history") or [])
@@ -92,6 +96,7 @@ class StateManager:
         if len(history) > self.max_history_entries:
             history = history[-self.max_history_entries :]
         self.state["history"] = history
+        self._snapshot_cache = None
 
     def record_files(self, paths: list[str]) -> None:
         files = list(self.state.get("files_created") or [])
@@ -99,6 +104,7 @@ class StateManager:
             if path not in files:
                 files.append(path)
         self.state["files_created"] = files
+        self._snapshot_cache = None
 
     def record_error(self, message: str) -> None:
         errors = list(self.state.get("errors") or [])
@@ -106,12 +112,22 @@ class StateManager:
         if len(errors) > self.max_history_entries:
             errors = errors[-self.max_history_entries :]
         self.state["errors"] = errors
+        self._snapshot_cache = None
 
     def reset(self) -> None:
         self.state = json.loads(json.dumps(DEFAULT_STATE))
+        self._snapshot_cache = None
         self.save()
 
     def snapshot(self) -> dict[str, Any]:
-        """A JSON-safe deep copy, for serving over HTTP without data races."""
-        copied: dict[str, Any] = json.loads(json.dumps(self.state))
+        """A JSON-safe deep copy, for serving over HTTP without data races.
+
+        Cached and invalidated by every mutator: /status polling used to pay
+        a full O(history) serialise-plus-parse on each request.
+        """
+        if self._snapshot_cache is None:
+            self._snapshot_cache = json.loads(json.dumps(self.state))
+        # Hand out a copy so a caller mutating the result cannot poison
+        # the cache for the next reader.
+        copied: dict[str, Any] = json.loads(json.dumps(self._snapshot_cache))
         return copied

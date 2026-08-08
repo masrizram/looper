@@ -90,6 +90,8 @@ class LooperDaemon:
         # Cost observability: an unattended daemon must report what it spends.
         snapshot["token_usage"] = self.client.total_usage.as_dict()
         snapshot["llm_calls"] = self.client.call_count
+        snapshot["cost_usd"] = self.client.running_cost_usd()
+        snapshot["cost_by_model"] = self.client.cost_by_model()
         return snapshot
 
     # -- Lifecycle -------------------------------------------------------

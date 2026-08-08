@@ -313,13 +313,11 @@ def test_build_aborts_when_cost_budget_exceeded(raw_config, daemon_factory, stub
 
     config = cfg_from(raw_config, execution={"max_cost_usd": 0.50, "max_cycles": 5})
     daemon = daemon_factory(cfg=config)
-    # Force the client to report a spend already above the ceiling.
+    # Force the client to report a spend already above the ceiling. Spend is
+    # now an accumulator written by call(), so the test sets it directly
+    # instead of back-deriving it from token usage.
     expensive = OpenRouterClient(config.openrouter, config.retry, client=object())
-    expensive.total_usage = expensive.total_usage  # unchanged
-    expensive._default_price = 1.0  # $1 / 1K tokens
-    expensive.total_usage = type(expensive.total_usage)(
-        prompt_tokens=10_000, completion_tokens=0
-    )  # 10K tokens * $1/1K = $10 > $0.50
+    expensive._cost_usd = 10.0  # $10 > $0.50 ceiling
     daemon.client = expensive
 
     with pytest.raises(CostBudgetExceeded):

@@ -15,12 +15,14 @@ import ast
 import re
 from dataclasses import dataclass
 
-#: Matches an assertion of the expected score, e.g. "assert score == 95"
-#: or "assert total > 90". Hardcoding the gate value is the signature of a
-#: test written to pass rather than to verify.
+#: Matches an assertion of a hardcoded expected verdict, e.g.
+#: ``assert score == 95``. Requires a *literal* on the right-hand side: an
+#: earlier version also matched ``assert result.tests_passed == expected``,
+#: flagging legitimate suites (including looper's own) as written-to-pass.
 _SCORE_HARDCODE_RE = re.compile(
-    r"assert\s+.*\b(score|total|build_ok|tests_passed)\b.*(==|>=|<=|>|<)",
-    re.IGNORECASE,
+    r"assert\s+[^\n=<>!]*\b(score|total|build_ok|tests_passed)\b[^\n]*"
+    r"(==|>=|<=|>|<)\s*(\d+(?:\.\d+)?|True|False)\s*(?:#[^\n]*)?$",
+    re.IGNORECASE | re.MULTILINE,
 )
 _ASSERT_RE = re.compile(r"^\s*(async\s+)?def\s+test_", re.MULTILINE)
 
@@ -36,19 +38,22 @@ class AdequacyReport:
     reason: str
 
 
-def _count_assert_statements(source: str) -> int:
+def _count_assert_statements(source: str, tree: ast.AST | None = None) -> int:
     """Count ``assert`` statements that live inside ``def test_`` functions.
 
     A bare ``assert`` anywhere (e.g. inside a helper) does not count; only
-    assertions that actually run as part of a test exercise the code.
+    assertions that actually run as part of a test exercise the code. The
+    caller may pass an already-parsed, parent-annotated ``tree`` to avoid a
+    second parse of the same untrusted source.
     """
-    if not source.strip():
-        return 0
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return 0
-    _attach_parents(tree)
+    if tree is None:
+        if not source.strip():
+            return 0
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return 0
+        _attach_parents(tree)
     return sum(
         1
         for node in ast.walk(tree)
@@ -81,7 +86,9 @@ def evaluate_suite(source: str, *, min_assertions_per_100_lines: int) -> Adequac
         parsed = None
     if parsed is not None:
         _attach_parents(parsed)
-    assertion_statements = _count_assert_statements(source)
+    # Reuse the tree we already built: parsing untrusted source twice was
+    # pure waste, and the second parse silently discarded this one's result.
+    assertion_statements = _count_assert_statements(source, parsed)
     per_100 = round(assertion_statements / max(1, lines) * 100.0, 2)
     hardcodes = bool(_SCORE_HARDCODE_RE.search(source))
 

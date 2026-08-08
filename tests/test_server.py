@@ -330,8 +330,70 @@ def test_stop_is_idempotent():
 
 
 def test_client_id_falls_back_to_unknown():
+    server = make_server()
     request = FakeRequest({"goal": "x"}, remote=None)
-    assert HTTPServer._client_id(request) == "unknown"
+    assert server._client_id(request) == "unknown"
+
+
+def test_forwarded_for_is_ignored_from_an_untrusted_peer():
+    """M-2: believing X-Forwarded-For unconditionally lets any caller forge
+    a fresh rate-limit identity per request."""
+    server = make_server()
+    request = FakeRequest(
+        {"goal": "x"},
+        remote="203.0.113.9",
+        headers={"X-Forwarded-For": "1.2.3.4"},
+    )
+    assert server._client_id(request) == "203.0.113.9"
+
+
+def test_forwarded_for_is_honoured_from_a_trusted_proxy():
+    """M-2: behind a configured proxy every client would otherwise collapse
+    into one shared bucket."""
+    server = make_server(trusted_proxies=("10.0.0.1",))
+    request = FakeRequest(
+        {"goal": "x"},
+        remote="10.0.0.1",
+        headers={"X-Forwarded-For": "1.2.3.4, 10.0.0.1"},
+    )
+    assert server._client_id(request) == "1.2.3.4"
+
+
+def test_trusted_proxy_without_forwarded_header_uses_the_peer():
+    server = make_server(trusted_proxies=("10.0.0.1",))
+    request = FakeRequest({"goal": "x"}, remote="10.0.0.1")
+    assert server._client_id(request) == "10.0.0.1"
+
+
+def test_trusted_proxy_with_blank_forwarded_header_uses_the_peer():
+    server = make_server(trusted_proxies=("10.0.0.1",))
+    request = FakeRequest(
+        {"goal": "x"},
+        remote="10.0.0.1",
+        headers={"X-Forwarded-For": " , "},
+    )
+    assert server._client_id(request) == "10.0.0.1"
+
+
+def test_rate_limiter_client_table_does_not_grow_without_bound():
+    """M-1: popping an empty bucket and recreating it was a no-op, leaving
+    one dict entry per source address forever."""
+    limiter = RateLimiter(limit_per_minute=5)
+    for index in range(500):
+        limiter.allow(f"10.1.{index // 256}.{index % 256}", now=1000.0)
+    assert limiter.tracked_clients == 500
+    # A later request past the window must evict every stale client.
+    limiter.allow("10.9.9.9", now=1000.0 + 120.0)
+    assert limiter.tracked_clients == 1
+
+
+def test_rate_limiter_evicts_oldest_when_over_capacity(monkeypatch):
+    """M-1: the table is hard-capped even inside a single window."""
+    limiter = RateLimiter(limit_per_minute=5)
+    monkeypatch.setattr(type(limiter), "MAX_CLIENTS", 10, raising=False)
+    for index in range(25):
+        limiter.allow(f"client-{index}", now=1000.0)
+    assert limiter.tracked_clients <= 10
 
 
 def test_missing_aiohttp_raises_clear_error(monkeypatch):

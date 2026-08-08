@@ -64,13 +64,71 @@ def test_config_rejects_bad_lint_mode():
         build_config({"execution": {"lint_generated": "ruff"}}, env={})
 
 
-def test_running_cost_uses_default_price():
-    """#1: cost estimate falls back to the default token price when unset."""
+def test_running_cost_starts_at_zero_and_accumulates_per_call():
+    """#1: spend is accumulated per call, never derived from total_usage.
+
+    Deriving it afterwards priced every token at the generic default,
+    under-reporting an Opus run by ~7.5x and making max_cost_usd a budget
+    in name only.
+    """
     client = OpenRouterClient.__new__(OpenRouterClient)
     client._default_price = 0.002
     client._model_prices = {}
+    client._cost_usd = 0.0
+    client._cost_by_model = {}
     client.total_usage = TokenUsage(prompt_tokens=1000, completion_tokens=0)
-    assert client.running_cost_usd() == pytest.approx(0.002)
+    # Usage alone must NOT create spend: only a recorded call does.
+    assert client.running_cost_usd() == pytest.approx(0.0)
+
+
+def test_running_cost_prices_each_model_separately():
+    """#1: an Opus call and a cheap call must not cost the same per token."""
+    import asyncio as _asyncio
+
+    from looper.config import AgentSpec, OpenRouterConfig, RetryPolicy
+
+    class _Msg:
+        def __init__(self, text):
+            self.content = text
+
+    class _Choice:
+        def __init__(self, text):
+            self.message = _Msg(text)
+
+    class _Usage:
+        prompt_tokens = 1_000_000
+        completion_tokens = 0
+
+    class _Resp:
+        choices = [_Choice("ok")]
+        usage = _Usage()
+
+    class _Completions:
+        async def create(self, **kwargs):
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _SDKClient:
+        chat = _Chat()
+
+    client = OpenRouterClient(
+        OpenRouterConfig(),
+        RetryPolicy(),
+        client=_SDKClient(),
+        model_prices_usd_per_1k={"pricey/model": 0.015, "cheap/model": 0.0002},
+        default_token_price_usd=0.002,
+    )
+    _asyncio.run(client.call(AgentSpec("pricey/model", "Researcher"), "x"))
+    assert client.running_cost_usd() == pytest.approx(15.0)
+
+    _asyncio.run(client.call(AgentSpec("cheap/model", "Writer"), "x"))
+    assert client.running_cost_usd() == pytest.approx(15.2)
+
+    breakdown = client.cost_by_model()
+    assert breakdown["pricey/model"] == pytest.approx(15.0)
+    assert breakdown["cheap/model"] == pytest.approx(0.2)
 
 
 def test_model_price_per_1k_falls_back_to_default():

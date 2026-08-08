@@ -166,6 +166,13 @@ class HTTPConfig:
     max_goal_length: int = 20_000
     rate_limit_per_minute: int = 10
     max_body_bytes: int = 65_536
+    #: Peer addresses whose ``X-Forwarded-For`` header may be believed. Behind
+    #: a reverse proxy every request otherwise shares one remote address, so
+    #: the per-client rate limit degrades into a single global bucket. Empty
+    #: (the default) means the header is ignored entirely - trusting it
+    #: unconditionally would let any caller forge an identity and bypass the
+    #: limit outright.
+    trusted_proxies: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_int(self.port, "http.port", 1, 65535)
@@ -174,6 +181,8 @@ class HTTPConfig:
         _require_int(self.max_body_bytes, "http.max_body_bytes", 1, 100_000_000)
         if not isinstance(self.bind, str) or not self.bind:
             raise ConfigError(f"http.bind must be a non-empty string, got {self.bind!r}")
+        if not isinstance(self.trusted_proxies, tuple):
+            raise ConfigError(f"http.trusted_proxies must be a list, got {self.trusted_proxies!r}")
 
         # ANY non-loopback bind is network-reachable, not just 0.0.0.0. The
         # earlier check special-cased 0.0.0.0 only, so binding a LAN address
@@ -485,6 +494,7 @@ def build_config(
         max_goal_length=http_raw.get("max_goal_length", 20_000),
         rate_limit_per_minute=http_raw.get("rate_limit_per_minute", 10),
         max_body_bytes=http_raw.get("max_body_bytes", 65_536),
+        trusted_proxies=tuple(str(p) for p in (http_raw.get("trusted_proxies") or ())),
     )
 
     exec_raw = section("execution")

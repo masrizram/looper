@@ -1,0 +1,105 @@
+"""Workspace filesystem sink: path containment and size-capped writes.
+
+This is the only place LLM-influenced names become real paths, so the
+containment rules live here rather than being restated at each call site
+(ADR-001). Splitting it out of the phase logic also means the escape rules
+can be reviewed and tested without spinning up an agent pipeline.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+
+from looper.config import LooperConfig
+from looper.phases.results import WorkspaceEscapeError
+from looper.state import StateManager
+
+logger = logging.getLogger("looper.phases")
+
+RESEARCH_FILE = "research.md"
+DESIGN_FILE = "architecture/design.md"
+CODE_FILE = "src/generated_code.py"
+OPTIMIZED_FILE = "src/optimized_code.py"
+TESTS_FILE = "tests/test_generated.py"
+REVIEW_FILE = "review.md"
+SECURITY_FILE = "security_audit.md"
+DOCS_FILE = "docs/README.md"
+
+#: Agents habitually wrap code in ```python fences, and often prefix the
+#: block with prose ("Here is the code:"). Parsing the fenced text as Python
+#: would always raise, so the first fenced block's body is extracted; if there
+#: is no fence the text is returned unchanged (the builder may emit bare code).
+_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def strip_code_fences(text: str) -> str:
+    """Return the body of the first fenced block, or ``text`` unchanged.
+
+    A non-anchored search (not ``match``) is deliberate: a reply such as
+    "Here is the code:\\n```python\\nx = 1\\n```" must yield ``x = 1``, not the
+    whole fenced string, otherwise ``ast.parse`` rejects valid code and the
+    build fails closed for no reason.
+    """
+    match = _FENCE_RE.search(text or "")
+    return match.group(1).strip() if match else (text or "")
+
+
+class WorkspaceMixin:
+    """Path containment and capped writes for the workspace."""
+
+    config: LooperConfig
+    state: StateManager
+    workspace: Path
+
+    def resolve_in_workspace(self, relative_path: str) -> Path:
+        """Resolve ``relative_path`` inside the workspace, or refuse.
+
+        This is the single filesystem sink for LLM-influenced names, so the
+        containment check belongs here rather than at each call site. A
+        ``..`` check alone is not enough: a symlinked directory component
+        (planted by an earlier cycle, or by anything else with write access
+        to the workspace) redirects the write outside the root while the
+        resolved-path comparison still looks clean on some platforms.
+        """
+        root = self.workspace.resolve()
+        candidate = (root / relative_path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise WorkspaceEscapeError(f"Path escapes workspace: {relative_path!r}")
+        probe = candidate
+        while probe != root:
+            if probe.is_symlink():
+                raise WorkspaceEscapeError(f"Symlinked path component refused: {probe}")
+            probe = probe.parent
+        return candidate
+
+    def write_file(self, relative_path: str, content: str) -> str:
+        """Write agent output into the workspace, size-capped.
+
+        Content is truncated rather than rejected: a partial artifact is more
+        useful to the next phase than none, and the marker makes the
+        truncation obvious to both the reviewer agent and a human.
+        """
+        path = self.resolve_in_workspace(relative_path)
+        limit = self.config.execution.max_file_bytes
+        encoded = content.encode("utf-8")
+        if len(encoded) > limit:
+            logger.warning(
+                "Agent output for %s is %d bytes, over the %d byte cap; truncating",
+                relative_path,
+                len(encoded),
+                limit,
+            )
+            content = encoded[:limit].decode("utf-8", errors="ignore")
+            content += f"\n\n# [TRUNCATED by looper at {limit} bytes]\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self.state.record_files([str(path)])
+        return str(path)
+
+    def read_file(self, relative_path: str) -> str:
+        path = self.resolve_in_workspace(relative_path)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""

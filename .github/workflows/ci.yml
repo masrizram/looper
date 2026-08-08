@@ -108,6 +108,34 @@ jobs:
       - name: config.yaml must pass validation
         run: python -m looper.cli --check-config
 
+  # A-4: the 100% coverage gate cannot prove the sandbox *contains* hostile
+  # code -- it only proves the subprocess launch lines executed. This job runs
+  # genuinely destructive payloads (filesystem escape, runaway CPU, fork bomb)
+  # through run_sandboxed and fails the build if any of them reaches the host.
+  # Coverage was giving a false sense of safety on the two isolation bugs
+  # flagged in the v3 audit (H-1 docker_argv, H-3 rlimit tuple shape).
+  sandbox-integration:
+    name: Sandbox containment (real payloads)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Pull sandbox image
+        run: docker pull python:3.11-slim
+
+      - name: Run hostile-payload containment test
+        run: python scripts/sandbox_integration_test.py
+
   models:
     name: Verify model slugs against OpenRouter
     runs-on: ubuntu-latest

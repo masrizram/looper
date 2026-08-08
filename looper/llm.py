@@ -152,6 +152,13 @@ class OpenRouterClient:
         self.call_count = 0
         self._model_prices = dict(model_prices_usd_per_1k or {})
         self._default_price = default_token_price_usd
+        #: Spend is accumulated per call, while the model is still known.
+        #: Deriving it afterwards from ``total_usage`` is impossible: usage
+        #: carries no model, so every token would be priced at the generic
+        #: default and an Opus-heavy run under-reported by roughly 7x --
+        #: making ``max_cost_usd`` (ADR-005) a budget in name only.
+        self._cost_usd = 0.0
+        self._cost_by_model: dict[str, float] = {}
 
         if client is not None:
             self._client = client
@@ -217,13 +224,19 @@ class OpenRouterClient:
                 )
                 usage = usage_of(response)
                 self.total_usage = self.total_usage + usage
+                call_cost = usage.estimated_cost_usd(self.model_price_per_1k(agent.model))
+                self._cost_usd += call_cost
+                self._cost_by_model[agent.model] = round(
+                    self._cost_by_model.get(agent.model, 0.0) + call_cost, 6
+                )
                 self.call_count += 1
                 logger.info(
-                    "Agent %s ok in %d attempt(s); tokens=%d (run total=%d)",
+                    "Agent %s ok in %d attempt(s); tokens=%d (run total=%d) cost=$%.4f",
                     agent.role,
                     attempt,
                     usage.total_tokens,
                     self.total_usage.total_tokens,
+                    call_cost,
                 )
                 return AgentReply(
                     text=response.choices[0].message.content or "",
@@ -290,5 +303,9 @@ class OpenRouterClient:
         return float(self._model_prices.get(model, self._default_price))
 
     def running_cost_usd(self) -> float:
-        """Estimated spend so far across every agent call in this run."""
-        return round(self.total_usage.estimated_cost_usd(self._default_price), 6)
+        """Estimated spend so far, priced per-model at the time of each call."""
+        return round(self._cost_usd, 6)
+
+    def cost_by_model(self) -> dict[str, float]:
+        """Per-model spend breakdown -- what an operator needs from /metrics."""
+        return dict(self._cost_by_model)
