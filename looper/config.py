@@ -144,6 +144,13 @@ DEFAULT_MODEL_PRICES_USD_PER_1K: Mapping[str, float] = {
     "x-ai/grok-4.5": 0.004,
 }
 
+#: Per-model USD per 1K *completion* tokens. Empty by default on purpose: the
+#: prices above are already blended input/output figures, so inventing a
+#: multiplier here would make the estimate less accurate, not more. Operators
+#: who know their real split can set ``execution.completion_prices_usd_per_1k``
+#: and get exact accounting; everyone else keeps the blended behaviour.
+DEFAULT_COMPLETION_PRICES_USD_PER_1K: Mapping[str, float] = {}
+
 #: Phase name -> agent key. Used to validate that configured phases are runnable.
 PHASE_AGENTS: Mapping[str, str] = {
     "research": "researcher",
@@ -293,6 +300,11 @@ class ExecutionConfig:
         default_factory=lambda: dict(DEFAULT_MODEL_PRICES_USD_PER_1K)
     )
     default_token_price_usd: float = 0.002
+    #: Per-model USD price per 1K *completion* tokens. Providers bill output
+    #: at 3-5x the input rate, so pricing both sides the same under-reported
+    #: every output-heavy run. Missing entries fall back to the prompt price,
+    #: which is exactly the previous behaviour.
+    completion_prices_usd_per_1k: Mapping[str, float] = field(default_factory=dict)
     #: Optional path (relative to --config dir or absolute) to a user-owned
     #: pytest suite. If set, the generated code must ALSO pass the user's
     #: tests before the build can clear the gate - closes the self-test
@@ -309,6 +321,11 @@ class ExecutionConfig:
     #: suite for destructive/network calls first and refuse to run it.
     sandbox_tests: bool = True
     sandbox_cpu_seconds: int = 60
+    #: Docker/Podman ``--cpus`` scheduler share. Separate from
+    #: ``sandbox_cpu_seconds`` on purpose: one is a throttle, the other a hard
+    #: kill. Deriving the share from the budget gave a long-running sandbox
+    #: *more* CPU, which is backwards.
+    sandbox_cpu_shares: float = 1.0
     sandbox_wall_seconds: int = 300
     sandbox_rss_bytes: int = 1_000_000_000
     #: Which isolation backend to use: auto|rlimit|docker|podman|none.
@@ -359,6 +376,7 @@ class ExecutionConfig:
             1000,
         )
         _require_int(self.sandbox_cpu_seconds, "execution.sandbox_cpu_seconds", 1, 86_400)
+        _require_number(self.sandbox_cpu_shares, "execution.sandbox_cpu_shares", 0.1, 256.0)
         _require_int(self.sandbox_wall_seconds, "execution.sandbox_wall_seconds", 1, 86_400)
         _require_int(
             self.sandbox_rss_bytes,
@@ -525,10 +543,15 @@ def build_config(
             **exec_raw.get("model_prices_usd_per_1k", {}),
         },
         default_token_price_usd=exec_raw.get("default_token_price_usd", 0.002),
+        completion_prices_usd_per_1k={
+            **DEFAULT_COMPLETION_PRICES_USD_PER_1K,
+            **exec_raw.get("completion_prices_usd_per_1k", {}),
+        },
         user_tests_dir=exec_raw.get("user_tests_dir", ""),
         min_test_assertions_per_100_lines=exec_raw.get("min_test_assertions_per_100_lines", 6),
         sandbox_tests=exec_raw.get("sandbox_tests", True),
         sandbox_cpu_seconds=exec_raw.get("sandbox_cpu_seconds", 60),
+        sandbox_cpu_shares=exec_raw.get("sandbox_cpu_shares", 1.0),
         sandbox_wall_seconds=exec_raw.get("sandbox_wall_seconds", 300),
         sandbox_rss_bytes=exec_raw.get("sandbox_rss_bytes", 1_000_000_000),
         sandbox_backend=str(exec_raw.get("sandbox_backend", "auto")),

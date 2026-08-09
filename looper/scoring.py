@@ -49,14 +49,24 @@ NO_ISSUES_MARKERS = ("no issues found", "no vulnerabilities found", "no findings
 def reports_no_issues(text: str) -> bool:
     """True when an auditor's prose declares the code clean.
 
-    A negation anywhere earlier on the matching line disqualifies it: the
-    phrase is being contradicted, not asserted.
+    Two ways prose lies about being clean, and both are refused:
+
+    * a negation *anywhere* on the line -- the earlier version only looked at
+      the text before the match, so "Are there no vulnerabilities? Absolutely
+      not, I found 4 criticals." read as a clean bill of health;
+    * a question -- "no issues?" is asking, not asserting.
+
+    Erring toward "not clean" is the correct direction: a false clean scores a
+    vulnerable build as spotless, while a false dirty only injects one MEDIUM
+    "audit output not in expected format" finding the operator can see.
     """
     for line in (text or "").splitlines():
         match = NO_ISSUES_RE.search(line)
         if match is None:
             continue
-        if _NEGATION_RE.search(line[: match.start()]):
+        if _NEGATION_RE.search(line):
+            continue
+        if line.rstrip().endswith("?"):
             continue
         return True
     return False

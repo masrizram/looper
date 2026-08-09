@@ -42,8 +42,18 @@ class RateLimiter:
         self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
 
     def _evict(self, cutoff: float) -> None:
-        """Drop clients whose most recent hit fell out of the window."""
-        for client in [c for c, bucket in self._hits.items() if not bucket or bucket[-1] <= cutoff]:
+        """Drop clients whose most recent hit fell out of the window.
+
+        Walked oldest-first and stopped at the first live bucket: the table is
+        an ``OrderedDict`` kept in last-hit order by ``move_to_end``, so
+        everything after the first still-active client is also active. The
+        previous full-table comprehension ran 4096 iterations on *every*
+        request just to find the handful that had expired.
+        """
+        while self._hits:
+            client, bucket = next(iter(self._hits.items()))
+            if bucket and bucket[-1] > cutoff:
+                break
             del self._hits[client]
 
     def allow(self, client: str, now: float | None = None) -> bool:
@@ -78,6 +88,15 @@ class RateLimiter:
 class HTTPServer:
     """aiohttp application exposing the daemon's control endpoints."""
 
+    #: Ceiling on builds queued but not yet finished. The rate limiter bounds
+    #: requests *per client per minute*; it does not bound the work those
+    #: requests create. Builds are serialised by the daemon's lock, so an
+    #: accepted request that cannot start just sits in memory holding its
+    #: goal -- 500 POSTs queued 500 coroutines that would then run for hours
+    #: after the caller had gone. Refusing past this point is backpressure:
+    #: the caller learns immediately instead of being silently enqueued.
+    MAX_QUEUED_BUILDS = 8
+
     def __init__(
         self,
         config: HTTPConfig,
@@ -93,7 +112,12 @@ class HTTPServer:
         self._runner: Any | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._started_at = time.monotonic()
-        self._counters = {"build_accepted": 0, "build_rejected": 0, "build_unauthorized": 0}
+        self._counters = {
+            "build_accepted": 0,
+            "build_rejected": 0,
+            "build_unauthorized": 0,
+            "build_queue_full": 0,
+        }
 
         if web_module is not None:
             self._web = web_module
@@ -242,6 +266,21 @@ class HTTPServer:
             return self._json(
                 {"error": f"goal too long (max {self.config.max_goal_length} chars)"},
                 status=413,
+            )
+
+        # Backpressure. Checked last, so a malformed or unauthorised request
+        # is still answered precisely rather than being masked by a full
+        # queue, and 503 is only ever returned to a request that was
+        # otherwise about to be accepted.
+        if len(self._tasks) >= self.MAX_QUEUED_BUILDS:
+            self._counters["build_queue_full"] += 1
+            return self._json(
+                {
+                    "error": "build queue full",
+                    "in_flight": len(self._tasks),
+                    "max_queued": self.MAX_QUEUED_BUILDS,
+                },
+                status=503,
             )
 
         self._track(self.callback(goal))

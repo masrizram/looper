@@ -67,6 +67,19 @@ class WorkspaceMixin:
     state: StateManager
     workspace: Path
 
+    #: Relative paths whose most recent write hit ``max_file_bytes``. Declared
+    #: for typing only; each instance gets its own set on first write (a
+    #: class-level mutable would be shared by every PhaseManager).
+    _truncated_paths: set[str]
+
+    def _truncation_log(self) -> set[str]:
+        """This instance's truncation set, created on first use."""
+        existing = self.__dict__.get("_truncated_paths")
+        if existing is None:
+            existing = set()
+            self.__dict__["_truncated_paths"] = existing
+        return existing
+
     def resolve_in_workspace(self, relative_path: str) -> Path:
         """Resolve ``relative_path`` inside the workspace, or refuse.
 
@@ -91,14 +104,22 @@ class WorkspaceMixin:
     def write_file(self, relative_path: str, content: str) -> str:
         """Write agent output into the workspace, size-capped.
 
-        Content is truncated rather than rejected: a partial artifact is more
-        useful to the next phase than none, and the marker makes the
-        truncation obvious to both the reviewer agent and a human.
+        Prose artifacts are truncated rather than rejected: a partial research
+        note is more useful to the next phase than none, and the marker makes
+        the truncation obvious to both the reviewer agent and a human.
+
+        Python artifacts are different. A truncated module is usually still
+        *parseable* -- it just silently loses its last functions -- so
+        ``build_ok`` would describe a file the builder never actually wrote.
+        The truncation marker is a comment, so it cannot even fail the lint
+        gate. The caller is told via :meth:`last_write_truncated` so the build
+        can fail closed instead.
         """
         path = self.resolve_in_workspace(relative_path)
         limit = self.config.execution.max_file_bytes
         encoded = content.encode("utf-8")
-        if len(encoded) > limit:
+        truncated = len(encoded) > limit
+        if truncated:
             logger.warning(
                 "Agent output for %s is %d bytes, over the %d byte cap; truncating",
                 relative_path,
@@ -109,8 +130,17 @@ class WorkspaceMixin:
             content += f"\n\n# [TRUNCATED by looper at {limit} bytes]\n"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        self._truncation_log()
+        if truncated:
+            self._truncated_paths.add(relative_path)
+        else:
+            self._truncated_paths.discard(relative_path)
         self.state.record_files([str(path)])
         return str(path)
+
+    def was_truncated(self, relative_path: str) -> bool:
+        """True when the last write to ``relative_path`` hit the size cap."""
+        return relative_path in self._truncation_log()
 
     def read_file(self, relative_path: str) -> str:
         path = self.resolve_in_workspace(relative_path)

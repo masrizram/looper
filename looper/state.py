@@ -123,15 +123,22 @@ class StateManager:
         self._snapshot_cache = None
         self.save()
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, history_limit: int | None = None) -> dict[str, Any]:
         """A JSON-safe deep copy, for serving over HTTP without data races.
 
         Cached and invalidated by every mutator: /status polling used to pay
         a full O(history) serialise-plus-parse on each request.
+
+        ``history_limit`` trims the history tail *before* the defensive copy.
+        /status only ever shows the last 20 entries, so copying all 500 and
+        then slicing did 25x the serialisation work per poll.
         """
         if self._snapshot_cache is None:
             self._snapshot_cache = json.loads(json.dumps(self.state))
+        source = self._snapshot_cache
+        if history_limit is not None:
+            source = {**source, "history": source.get("history", [])[-history_limit:]}
         # Hand out a copy so a caller mutating the result cannot poison
         # the cache for the next reader.
-        copied: dict[str, Any] = json.loads(json.dumps(self._snapshot_cache))
+        copied: dict[str, Any] = json.loads(json.dumps(source))
         return copied

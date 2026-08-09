@@ -32,6 +32,11 @@ OUT_OF_CREDITS_STATUSES = frozenset({402})
 #: no structured ``status_code``.
 _STATUS_IN_TEXT_RE = re.compile(r"\b(?:error code|status(?:_code)?)\D{0,3}(\d{3})\b", re.I)
 
+#: Characters per token used to project a prompt's size before sending it.
+#: Real tokenisers average ~4 for English prose and code; 3 is deliberately
+#: pessimistic so the budget projection over-estimates rather than under.
+CHARS_PER_TOKEN = 3.0
+
 
 class LLMUnavailableError(RuntimeError):
     """Raised when the optional ``openai`` dependency is missing."""
@@ -102,9 +107,23 @@ class TokenUsage:
             "total_tokens": self.total_tokens,
         }
 
-    def estimated_cost_usd(self, price_per_1k: float) -> float:
-        """Rough spend in USD for this usage at ``price_per_1k`` USD / 1K tokens."""
-        return round(self.total_tokens / 1000.0 * price_per_1k, 6)
+    def estimated_cost_usd(
+        self, price_per_1k: float, completion_price_per_1k: float | None = None
+    ) -> float:
+        """Spend in USD for this usage, prompt and completion priced apart.
+
+        ``completion_price_per_1k`` defaults to the prompt price, preserving
+        the original single-rate behaviour for callers that do not know the
+        output rate.
+        """
+        completion_price = (
+            price_per_1k if completion_price_per_1k is None else completion_price_per_1k
+        )
+        return round(
+            self.prompt_tokens / 1000.0 * price_per_1k
+            + self.completion_tokens / 1000.0 * completion_price,
+            6,
+        )
 
 
 def usage_of(response: object) -> TokenUsage:
@@ -165,6 +184,7 @@ class OpenRouterClient:
         client: object | None = None,
         sdk: object | None = None,
         model_prices_usd_per_1k: Mapping[str, float] | None = None,
+        completion_prices_usd_per_1k: Mapping[str, float] | None = None,
         default_token_price_usd: float = 0.002,
         max_cost_usd: float = 0.0,
     ) -> None:
@@ -173,6 +193,11 @@ class OpenRouterClient:
         self.total_usage = TokenUsage()
         self.call_count = 0
         self._model_prices = dict(model_prices_usd_per_1k or {})
+        #: Completion tokens are billed at a different (higher) rate by every
+        #: major provider. Pricing both sides identically under-reported an
+        #: output-heavy run systematically, which matters now that the budget
+        #: check is what stops a call from being issued at all.
+        self._completion_prices = dict(completion_prices_usd_per_1k or {})
         self._default_price = default_token_price_usd
         #: Hard ceiling enforced at the point of spend. The orchestrator also
         #: checks the budget, but only between cycles -- and one cycle is
@@ -230,12 +255,14 @@ class OpenRouterClient:
         """Call ``agent`` with ``prompt``, retrying only transient failures.
 
         Raises :class:`~looper.config.CostBudgetExceeded` *before* issuing the
-        request when the run has already reached ``max_cost_usd``. Checking
-        here rather than only between cycles is what makes the ceiling hard:
-        a single cycle issues seven calls, so a between-cycles check alone let
-        an Opus roster overshoot a $1.00 budget by 18x.
+        request when the run has already reached ``max_cost_usd``, **or when
+        this call could push it past the ceiling**. Checking only the spend
+        already booked was still a soft cap: the first call always passed
+        whatever it cost, so a $1.00 budget on an Opus roster reached $15.00
+        in a single request. The ceiling has to be checked against the money
+        the call is *about* to spend, not the money already spent.
         """
-        self._check_budget()
+        self._check_budget(self.projected_cost_usd(agent, prompt, extra_system))
 
         system_prompt = (
             f"You are the {agent.role} on an autonomous multi-agent software "
@@ -263,7 +290,10 @@ class OpenRouterClient:
                 )
                 usage = usage_of(response)
                 self.total_usage = self.total_usage + usage
-                call_cost = usage.estimated_cost_usd(self.model_price_per_1k(agent.model))
+                call_cost = usage.estimated_cost_usd(
+                    self.model_price_per_1k(agent.model),
+                    self.completion_price_per_1k(agent.model),
+                )
                 self._cost_usd += call_cost
                 self._cost_by_model[agent.model] = round(
                     self._cost_by_model.get(agent.model, 0.0) + call_cost, 6
@@ -351,19 +381,49 @@ class OpenRouterClient:
             out_of_credits=out_of_credits,
         )
 
-    def _check_budget(self) -> None:
+    def _check_budget(self, projected_usd: float = 0.0) -> None:
         """Refuse a call that would spend past ``max_cost_usd``.
+
+        ``projected_usd`` is the worst-case cost of the call being considered.
+        Including it is what turns a soft cap into a hard one: without it the
+        first call of a run was always admitted at any price, so the ceiling
+        could only ever be discovered *after* it had been breached.
 
         Raised rather than returned as a failed ``AgentReply``: an exhausted
         budget is a run-level stop condition, not a per-agent failure the
         pipeline should score and move past.
         """
-        if self._max_cost_usd > 0 and self._cost_usd >= self._max_cost_usd:
+        if self._max_cost_usd > 0 and self._cost_usd + projected_usd >= self._max_cost_usd:
             raise CostBudgetExceeded(round(self._cost_usd, 6), self._max_cost_usd)
 
+    def projected_cost_usd(self, agent: AgentSpec, prompt: str, extra_system: str = "") -> float:
+        """Worst-case USD cost of one call to ``agent`` with ``prompt``.
+
+        The provider bills for the prompt it receives plus the completion it
+        produces. The completion is bounded by ``agent.max_tokens``, and the
+        prompt is estimated at :data:`CHARS_PER_TOKEN` characters per token --
+        a deliberate *over*-estimate is the safe direction here, because
+        under-estimating is exactly how the ceiling was breached.
+        """
+        prompt_tokens = (len(prompt) + len(extra_system)) / CHARS_PER_TOKEN
+        return round(
+            prompt_tokens / 1000.0 * self.model_price_per_1k(agent.model)
+            + agent.max_tokens / 1000.0 * self.completion_price_per_1k(agent.model),
+            6,
+        )
+
     def model_price_per_1k(self, model: str) -> float:
-        """USD price per 1K tokens for ``model``, or the configured default."""
+        """USD price per 1K *prompt* tokens for ``model``, or the default."""
         return float(self._model_prices.get(model, self._default_price))
+
+    def completion_price_per_1k(self, model: str) -> float:
+        """USD price per 1K *completion* tokens for ``model``.
+
+        Providers charge more for output than input (commonly 3-5x). Falling
+        back to the prompt price keeps the previous behaviour exactly when no
+        completion prices are configured, rather than inventing a multiplier.
+        """
+        return float(self._completion_prices.get(model, self.model_price_per_1k(model)))
 
     def running_cost_usd(self) -> float:
         """Estimated spend so far, priced per-model at the time of each call."""

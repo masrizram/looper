@@ -53,6 +53,12 @@ execution:
   # Default USD price per 1K tokens (used for cost estimates). Can be tightened
   # per model via model_prices_usd_per_1k (see the example below).
   default_token_price_usd: 0.002
+  # Optional per-model USD/1K for *completion* tokens. Left empty by default:
+  # model_prices_usd_per_1k already holds blended input/output figures, so
+  # inventing a multiplier would be less accurate, not more. Set this when you
+  # know your real split and want exact accounting (ADR-013).
+  # completion_prices_usd_per_1k:
+  #   anthropic/claude-opus-5: 0.075
   # model_prices_usd_per_1k:
   #   "anthropic/claude-3.5-sonnet": 0.003
   #   "openai/gpt-4o": 0.005
@@ -68,6 +74,11 @@ execution:
   # scanned first: os.system/subprocess/network/eval calls are REFUSED. ADR-06.
   sandbox_tests: true
   sandbox_cpu_seconds: 60
+  # Docker/Podman --cpus scheduler share. Deliberately separate from
+  # sandbox_cpu_seconds: --cpus throttles how fast a runaway loop burns,
+  # while cpu_seconds (RLIMIT_CPU) is what actually kills it. Deriving one
+  # from the other gave a longer-running sandbox *more* CPU (ADR-013).
+  sandbox_cpu_shares: 1.0
   sandbox_wall_seconds: 300
   sandbox_rss_bytes: 1000000000
   # Isolation backend: auto | rlimit | docker | none. ADR-008.

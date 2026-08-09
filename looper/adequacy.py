@@ -15,14 +15,25 @@ import ast
 import re
 from dataclasses import dataclass
 
-#: Matches an assertion of a hardcoded expected verdict, e.g.
-#: ``assert score == 95``. Requires a *literal* on the right-hand side: an
-#: earlier version also matched ``assert result.tests_passed == expected``,
-#: flagging legitimate suites (including looper's own) as written-to-pass.
+#: Matches an assertion of a hardcoded *looper verdict*, e.g.
+#: ``assert breakdown.raw_total == 95``. Scoped to identifiers this project
+#: actually owns: an earlier version matched any name *containing* "total",
+#: so a shopping-cart suite's ``assert c.total == 10`` was rejected as
+#: "written to pass". Any domain with a ``total``/``score`` attribute --
+#: invoices, quizzes, carts, games -- could therefore never clear the gate,
+#: which is a false positive with the same cost as a miss (ADR-012).
 _SCORE_HARDCODE_RE = re.compile(
-    r"assert\s+[^\n=<>!]*\b(score|total|build_ok|tests_passed)\b[^\n]*"
-    r"(==|>=|<=|>|<)\s*(\d+(?:\.\d+)?|True|False)\s*(?:#[^\n]*)?$",
-    re.IGNORECASE | re.MULTILINE,
+    # Strong names: looper's own verdict fields, flagged with or without a
+    # receiver -- `assert b.raw_total == 95` is a hardcoded verdict.
+    r"assert\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)*"
+    r"\b(?:review_score|final_score|raw_total|score_total|build_ok|tests_passed|tests_total)\b"
+    r"\s*(?:==|>=|<=|>|<|is)\s*(?:\d+(?:\.\d+)?|True|False)\s*(?:#[^\n]*)?$"
+    # Weak names: bare `score` / `total` only. With a receiver they belong to
+    # the domain under test (`cart.total`, `quiz.score`) and flagging those
+    # made any such domain unable to clear the gate.
+    r"|assert\s+\b(?:score|total)\b"
+    r"\s*(?:==|>=|<=|>|<|is)\s*(?:\d+(?:\.\d+)?|True|False)\s*(?:#[^\n]*)?$",
+    re.MULTILINE,
 )
 _ASSERT_RE = re.compile(r"^\s*(async\s+)?def\s+test_", re.MULTILINE)
 
@@ -121,25 +132,58 @@ def _counts_unittest_methods(tree: ast.AST) -> int:
     )
 
 
-def _imports_subject(tree: ast.AST) -> bool:
-    """True when the suite imports anything at all from outside itself.
+def _imports_subject(
+    tree: ast.AST, subject_modules: frozenset[str] = frozenset(), source: str = ""
+) -> bool:
+    """True when the suite imports the artifact actually under test.
 
     A suite of ``assert 1 == 1`` is perfectly dense and tests nothing. The
     density floor measures effort, not coverage, so it happily passed
-    tautologies while failing real suites. Requiring at least one import of
-    non-stdlib, non-test code is a cheap proxy for "this suite is connected
-    to the artifact under test".
+    tautologies while failing real suites.
+
+    The first fix required "any import outside a stdlib denylist", which
+    ``import logging`` satisfied -- so a tautological suite still passed. When
+    the caller knows which modules the build produced, the check becomes
+    exact: the suite must import *one of those*. When it does not (public API
+    callers, a build that wrote no module), we fall back to the denylist so
+    the gate degrades to its previous strictness instead of refusing
+    everything.
     """
+    imported = _imported_roots(tree)
+    if subject_modules:
+        # An exact import of the artifact is the strongest signal, but a suite
+        # may legitimately reach the artifact without importing it by name --
+        # reading ``src/generated_code.py`` from disk, or driving it as a
+        # subprocess/CLI. Naming the module anywhere in the source is enough
+        # to show the suite is connected to it; a tautology that names nothing
+        # still fails.
+        if imported & subject_modules:
+            return True
+        return any(_mentions_module(source, name) for name in subject_modules)
+    return bool(imported - _NON_SUBJECT_MODULES)
+
+
+def _mentions_module(source: str, module: str) -> bool:
+    """True when ``module`` appears as a whole word in ``source``."""
+    return re.search(rf"\b{re.escape(module)}\b", source) is not None
+
+
+def _imported_roots(tree: ast.AST) -> set[str]:
+    """Top-level module names this source imports, by absolute syntax.
+
+    Relative imports (``from . import sibling``) are deliberately excluded:
+    the generated suite is written to a flat ``tests/`` directory that is not
+    a package, so a relative import cannot resolve and is evidence of a
+    confused suite rather than of a real subject under test.
+    """
+    roots: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if module and module.split(".")[0] not in _NON_SUBJECT_MODULES:
-                return True
+            if node.module and not node.level:
+                roots.add(node.module.split(".")[0])
         elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".")[0] not in _NON_SUBJECT_MODULES:
-                    return True
-    return False
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+    return roots
 
 
 #: Imports that do not indicate a subject under test: the test framework
@@ -181,8 +225,19 @@ def _attach_parents(tree: ast.AST) -> None:
             child.parent = node  # type: ignore[attr-defined]
 
 
-def evaluate_suite(source: str, *, min_assertions_per_100_lines: int) -> AdequacyReport:
-    """Decide whether a generated test suite is strong enough to count."""
+def evaluate_suite(
+    source: str,
+    *,
+    min_assertions_per_100_lines: int,
+    subject_modules: frozenset[str] = frozenset(),
+) -> AdequacyReport:
+    """Decide whether a generated test suite is strong enough to count.
+
+    ``subject_modules`` are the top-level module names the build actually
+    produced. Supplying them turns the "is this suite connected to anything?"
+    check from a stdlib denylist into an exact match, which is what stops a
+    tautological suite passing on the strength of ``import logging``.
+    """
     lines = source.count("\n") + 1
     try:
         parsed = ast.parse(source)
@@ -198,7 +253,9 @@ def evaluate_suite(source: str, *, min_assertions_per_100_lines: int) -> Adequac
     assertion_statements = _count_assert_statements(source, parsed)
     per_100 = round(assertion_statements / max(1, lines) * 100.0, 2)
     hardcodes = bool(_SCORE_HARDCODE_RE.search(source))
-    imports_subject = _imports_subject(parsed) if parsed is not None else False
+    imports_subject = (
+        _imports_subject(parsed, subject_modules, source) if parsed is not None else False
+    )
 
     def _report(*, ok: bool, reason: str) -> AdequacyReport:
         return AdequacyReport(

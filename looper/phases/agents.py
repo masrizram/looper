@@ -36,13 +36,16 @@ from looper.state import StateManager
 logger = logging.getLogger("looper.phases")
 
 #: Matches a reviewer's verdict line, e.g. ``Score: 88``, ``**Final Score:
-#: 92/100**``. Anchored to a whole line and requiring an explicit ``:``/``=``
-#: separator: an unanchored ``score\s*[:=]?\s*(\d+)`` matched the ``3`` in
+#: 92/100**``, or a markdown table row ``| Final Score | 88 |``. Anchored to a
+#: whole line: an unanchored ``score\s*[:=]?\s*(\d+)`` matched the ``3`` in
 #: prose such as "Score 3 major problems remain", so a reviewer's sentence
 #: could silently set the score to 3 and send a good build into a fix cycle.
+#: The table form is included because reviewers routinely summarise in a
+#: table, and failing to parse it scored a passing build 0 -- costing a full
+#: extra cycle for a formatting difference.
 REVIEW_SCORE_RE = re.compile(
-    r"^[ \t]*\**\s*(?:final|overall|total)?\s*score\**\s*[:=]\s*"
-    r"(\d+(?:\.\d+)?)\s*(?:/\s*100)?\s*\**[ \t]*$",
+    r"^[ \t]*(?:\|\s*)?\**\s*(?:final|overall|total)?\s*score\s*\**\s*(?:[:=]|\|)\s*\**\s*"
+    r"(\d+(?:\.\d+)?)\s*(?:/\s*100)?\s*(?:\**[ \t]*|\**\s*\|.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -58,6 +61,9 @@ class AgentPhasesMixin:
 
     # Provided by the sibling mixins; declared for type checking.
     def write_file(self, relative_path: str, content: str) -> str:  # pragma: no cover
+        raise NotImplementedError
+
+    def was_truncated(self, relative_path: str) -> bool:  # pragma: no cover
         raise NotImplementedError
 
     def read_file(self, relative_path: str) -> str:  # pragma: no cover
@@ -196,6 +202,14 @@ class AgentPhasesMixin:
         # test phase's import, rather than the raw fenced blob.
         if build_ok:
             self.write_file(CODE_FILE, strip_code_fences(reply.text))
+            # A truncated module usually still parses -- it has simply lost
+            # its tail -- so build_ok would describe code the builder never
+            # wrote, and the marker is a comment so lint cannot catch it.
+            if self.was_truncated(CODE_FILE):
+                note = "generated code exceeded max_file_bytes and was truncated"
+                self.state.record_error(f"build: {note}")
+                self.state.save()
+                return replace_result(result, build_ok=False, summary=note)
         # Style/compile gate so obviously-broken or malformed output never
         # reaches the "done" state even when it parses.
         lint_ok, lint_note = self._lint_generated(CODE_FILE)

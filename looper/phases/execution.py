@@ -116,12 +116,37 @@ class ExecutionMixin:
         report = evaluate_suite(
             test_src,
             min_assertions_per_100_lines=self.config.execution.min_test_assertions_per_100_lines,
+            subject_modules=self._subject_modules(),
         )
         if not report.ok:
             logger.error("Generated test suite inadequate: %s", report.reason)
             return 0, 1, f"test suite inadequate: {report.reason}"
 
         return await self._run_pytest(tests_dir)
+
+    def _subject_modules(self) -> frozenset[str]:
+        """Top-level module names the build actually wrote into ``src/``.
+
+        Handing these to the adequacy gate is what makes "does this suite test
+        anything?" an exact question. Without them a tautological suite passed
+        by importing ``logging``. An empty result (no src tree yet) makes the
+        gate fall back to its stdlib-denylist behaviour rather than refusing
+        every suite.
+        """
+        src = self.workspace / "src"
+        try:
+            entries = list(src.iterdir())
+        except OSError:
+            return frozenset()
+        names = {
+            entry.stem
+            for entry in entries
+            if entry.is_file() and entry.suffix == ".py" and not entry.name.startswith("_")
+        }
+        names |= {
+            entry.name for entry in entries if entry.is_dir() and not entry.name.startswith("_")
+        }
+        return frozenset(names)
 
     async def _run_user_tests(self) -> tuple[int, int, str]:
         """Run the user-owned suite (if configured) against the generated code.
@@ -189,6 +214,7 @@ class ExecutionMixin:
                     cwd=str(self.workspace),
                     timeout=timeout,
                     cpu_seconds=exec_cfg.sandbox_cpu_seconds,
+                    cpu_shares=exec_cfg.sandbox_cpu_shares,
                     wall_seconds=exec_cfg.sandbox_wall_seconds,
                     rss_bytes=exec_cfg.sandbox_rss_bytes,
                     backend=exec_cfg.sandbox_backend,

@@ -17,6 +17,8 @@ reader (or a future us) does not undo a decision without knowing its reasons.
 | [010](010-git-integration.md) | Per-cycle git commit trail | Accepted |
 | [011](011-split-phases-by-responsibility.md) | Split phases.py by responsibility | Accepted |
 | [012](012-calibrate-heuristics-both-directions.md) | Calibrate heuristics in both directions | Accepted |
+| [013](013-reserve-budget-before-the-call.md) | Reserve the budget before the call, not after it | Accepted |
+| [014](014-measure-gates-in-both-directions.md) | Gates must be measured in both directions | Accepted |
 
 ## Format
 

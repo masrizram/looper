@@ -21,7 +21,7 @@ import tokenize
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 logger = logging.getLogger("looper.sandbox")
 
@@ -58,7 +58,7 @@ DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("pickle.loads", "deserialization via pickle"),
     ("os.fork", "process forking"),
     ("os.kill", "signal delivery via os.kill"),
-    ("ctypes", "native code via ctypes"),
+    ("ctypes.", "native code via ctypes"),
 )
 
 #: Fully-qualified call targets refused by the AST pass. Matching the dotted
@@ -198,15 +198,45 @@ def _strip_comments_and_strings(source: str) -> str:
         return source
 
 
-def _dotted_name(func: ast.expr) -> str:
-    """Return the dotted call target, e.g. ``os.path.join``, or ``""``."""
+def _import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Local name -> fully-qualified module path, from every import form.
+
+    Without this the AST pass compared *source text* to a table of dotted
+    paths, so two of the three commonest ways to reach ``os.system`` walked
+    straight through: ``import os as o; o.system(...)`` and
+    ``from os import system; system(...)`` both scanned clean. Resolving the
+    name at its binding site is what makes the dotted-path table mean what it
+    says.
+    """
+    table: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # `import os.path` binds `os`; `import os.path as p` binds `p`.
+                table[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                table[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return table
+
+
+def _dotted_name(func: ast.expr, aliases: Mapping[str, str] | None = None) -> str:
+    """Return the dotted call target, e.g. ``os.path.join``, or ``""``.
+
+    ``aliases`` maps locally-bound names back to their real module paths, so
+    an aliased or from-imported dangerous call resolves to the same string a
+    plain ``os.system`` would.
+    """
     parts: list[str] = []
     node: ast.expr | None = func
     while isinstance(node, ast.Attribute):
         parts.append(node.attr)
         node = node.value
     if isinstance(node, ast.Name):
-        parts.append(node.id)
+        root = aliases.get(node.id, node.id) if aliases else node.id
+        parts.append(root)
         return ".".join(reversed(parts))
     return ""
 
@@ -215,22 +245,43 @@ def _receiver_root(node: ast.expr) -> str:
     """Name at the root of an attribute/subscript/path-join chain.
 
     ``tmp_path``, ``tmp_path / "d.json"``, ``tmp_path.joinpath("a")["b"]`` all
-    resolve to ``"tmp_path"``. Anything unresolvable yields ``""``.
+    resolve to ``"tmp_path"``. A call is followed through its *first argument*
+    as well as its target, because the idiomatic helper form
+    ``make_file(tmp_path).write_text(...)`` roots the path in the argument,
+    not the function -- and refusing that refused a legitimate suite.
+    Anything unresolvable yields ``""``.
     """
     current: ast.expr = node
-    while True:
+    for _ in range(_RECEIVER_RESOLUTION_DEPTH):
         if isinstance(current, (ast.Attribute, ast.Subscript)):
             current = current.value
         elif isinstance(current, ast.BinOp):
             current = current.left
         elif isinstance(current, ast.Call):
+            # Two shapes root a path in a fixture, and both must resolve:
+            # `tmp_path.joinpath("a")` roots through the *callable*, while
+            # `make_file(tmp_path)` roots through the *argument*. Trying the
+            # callable first keeps the original behaviour intact and only
+            # falls back to the argument when the callable leads nowhere.
+            via_func = _receiver_root(current.func)
+            if via_func in SANDBOXED_RECEIVERS:
+                return via_func
+            if current.args:
+                via_arg = _receiver_root(current.args[0])
+                if via_arg in SANDBOXED_RECEIVERS:
+                    return via_arg
             current = current.func
         else:
             break
     return current.id if isinstance(current, ast.Name) else ""
 
 
-def _is_opaque_getattr(node: ast.Call) -> bool:
+#: Bounds the walk above; chains deeper than this in a test suite are not a
+#: shape worth resolving, and an unbounded loop on hostile input is not either.
+_RECEIVER_RESOLUTION_DEPTH = 16
+
+
+def _is_opaque_getattr(node: ast.Call, aliases: Mapping[str, str] | None = None) -> bool:
     """True when ``getattr`` is used to reach an attribute indirectly.
 
     Blanket-flagging every ``getattr`` was noise: ``getattr(obj, "name",
@@ -241,10 +292,11 @@ def _is_opaque_getattr(node: ast.Call) -> bool:
     refused whatever the form, and a plain three-argument lookup on an
     ordinary object is not.
     """
-    if _dotted_name(node.func) != "getattr" or len(node.args) < 2:
+    if _dotted_name(node.func, aliases) != "getattr" or len(node.args) < 2:
         return False
     receiver = _receiver_root(node.args[0])
-    if receiver in DANGEROUS_GETATTR_RECEIVERS:
+    resolved = aliases.get(receiver, receiver) if aliases else receiver
+    if resolved.split(".")[0] in DANGEROUS_GETATTR_RECEIVERS:
         return True
     name_arg = node.args[1]
     return not (isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str))
@@ -318,15 +370,19 @@ def scan_source(source: str) -> ScanVerdict:
         return ScanVerdict(refuse=_dedupe(refuse), warn=_dedupe(warn))
 
     confined = _sandboxed_aliases(tree)
+    aliases = _import_aliases(tree)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        dotted = _dotted_name(node.func)
+        dotted = _dotted_name(node.func, aliases)
         if dotted in DANGEROUS_CALL_PATHS:
             refuse.append(f"calls dangerous function '{dotted}'")
             continue
-        if _is_opaque_getattr(node):
+        if _is_writable_open(node, dotted):
+            refuse.append("opens a file for writing via open()")
+            continue
+        if _is_opaque_getattr(node, aliases):
             refuse.append("dynamic attribute lookup via getattr")
             continue
         if isinstance(node.func, ast.Attribute) and node.func.attr in DANGEROUS_METHOD_NAMES:
@@ -339,6 +395,35 @@ def scan_source(source: str) -> ScanVerdict:
                 refuse.append(f"calls filesystem-mutating method '{node.func.attr}'")
 
     return ScanVerdict(refuse=_dedupe(refuse), warn=_dedupe(warn))
+
+
+#: Modes that make ``open`` a write. ``open(p)`` and ``open(p, "r")`` are
+#: ordinary reads and stay allowed; anything that can create, truncate or
+#: append is a filesystem mutation the tripwire must see.
+_WRITE_MODE_CHARS: frozenset[str] = frozenset({"w", "a", "x", "+"})
+
+
+def _is_writable_open(node: ast.Call, dotted: str) -> bool:
+    """True for ``open(path, "w")`` and friends, including ``Path.open``.
+
+    ``open(...).write(...)`` reached the host filesystem untouched: the AST
+    pass only looked at the *call target*, and ``open`` was not in the dotted
+    table, while the ``write`` method call had an unresolvable receiver that
+    is not in :data:`DANGEROUS_METHOD_NAMES`.
+    """
+    if dotted != "open" and not (isinstance(node.func, ast.Attribute) and node.func.attr == "open"):
+        return False
+    mode: str | None = None
+    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+        value = node.args[1].value
+        mode = value if isinstance(value, str) else None
+    for keyword in node.keywords:
+        if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+            value = keyword.value.value
+            mode = value if isinstance(value, str) else mode
+    if mode is None:
+        return False
+    return bool(set(mode) & _WRITE_MODE_CHARS)
 
 
 def _dedupe(reasons: list[str]) -> tuple[str, ...]:
@@ -552,6 +637,7 @@ def docker_argv(
     cpu_seconds: int,
     rss_bytes: int,
     runtime: str = "docker",
+    cpu_shares: float = 1.0,
 ) -> list[str]:
     """Wrap ``argv`` so it runs inside a throwaway, network-isolated container.
 
@@ -565,10 +651,14 @@ def docker_argv(
     contract (read-only, no network, capped cpu/mem/pids).
 
     ``--cpus`` is a *scheduler share*, not a CPU-time budget: it throttles how
-    fast a runaway loop burns, but never stops it. ``sandbox_cpu_seconds`` is
-    therefore also passed as ``--ulimit cpu=``, which is RLIMIT_CPU inside the
-    container and does kill the process -- giving the container backend the
-    same guarantee the rlimit backend already had.
+    fast a runaway loop burns, but never stops it. It is therefore its own
+    knob (``sandbox_cpu_shares``) rather than being derived from
+    ``sandbox_cpu_seconds`` -- the old ``cpu_seconds // 60`` formula handed a
+    600-second budget **ten whole CPUs**, quietly making the sandbox more
+    powerful the longer it was allowed to run. ``sandbox_cpu_seconds`` is
+    passed as ``--ulimit cpu=``, which is RLIMIT_CPU inside the container and
+    does kill the process -- giving the container backend the same guarantee
+    the rlimit backend already had.
     """
     inner = [to_container_path(arg, cwd) for arg in argv[1:]]
     return [
@@ -576,7 +666,7 @@ def docker_argv(
         "run",
         "--rm",
         f"--network={network}",
-        f"--cpus={max(1, cpu_seconds // 60) if cpu_seconds >= 60 else 1}",
+        f"--cpus={_format_cpu_shares(cpu_shares)}",
         f"--ulimit=cpu={max(1, cpu_seconds)}",
         f"--memory={max(64_000_000, rss_bytes)}b",
         "--pids-limit=256",
@@ -593,6 +683,17 @@ def docker_argv(
     ]
 
 
+def _format_cpu_shares(cpu_shares: float) -> str:
+    """Render ``--cpus`` without a pointless ``.0`` tail.
+
+    Docker accepts both ``1`` and ``1.0``, but the integer form is what
+    operators write in config and what appears in the docs, so keeping the
+    argv readable keeps the two comparable.
+    """
+    clamped = max(0.1, cpu_shares)
+    return str(int(clamped)) if clamped == int(clamped) else str(clamped)
+
+
 def run_sandboxed(
     argv: list[str],
     *,
@@ -606,6 +707,7 @@ def run_sandboxed(
     network: str = "none",
     fail_closed: bool = True,
     runner: Runner | None = None,
+    cpu_shares: float = 1.0,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``argv`` (fixed, never shell) under the strongest isolation available.
 
@@ -635,6 +737,7 @@ def run_sandboxed(
                 cpu_seconds=cpu_seconds,
                 rss_bytes=rss_bytes,
                 runtime=effective,
+                cpu_shares=cpu_shares,
             ),
             capture_output=True,
             text=True,

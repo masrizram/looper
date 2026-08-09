@@ -15,11 +15,18 @@ because the unguarded behaviour was a real hole, not a hypothetical one.
 ## The safeguards
 
 **Cost ceiling (`max_cost_usd`).** Each build tracks estimated API spend (token
-usage × per-model price). Crossing the ceiling aborts the build *hard* and
-exits `4` — no silent bill runaway
-([ADR-005](adr/005-cost-budget.md)). Prices for the default roster ship with
-the package; a model with no price falls back to `default_token_price_usd`,
-which under-reports frontier models badly, so keep the table current.
+usage × per-model price). Before every request the client *reserves* the call's
+worst-case cost — estimated prompt tokens plus the agent's `max_tokens`, at that
+model's price — and refuses the call outright if the reservation would cross the
+ceiling. Nothing is sent, so the refusal is free, and spend never exceeds the
+ceiling rather than exceeding it by one call and reporting so afterwards
+([ADR-005](adr/005-cost-budget.md),
+[ADR-013](adr/013-reserve-budget-before-the-call.md)). Crossing the ceiling
+aborts the build *hard* and exits `4` — no silent bill runaway. Prices for the
+default roster ship with the package; a model with no price falls back to
+`default_token_price_usd`, which under-reports frontier models badly, so keep
+the table current. Set `completion_prices_usd_per_1k` if you know your real
+input/output split and want exact rather than blended accounting.
 
 **Untrusted-code sandbox, fail-closed (`sandbox_backend`).** Generated test
 suites run either in a throwaway Docker container (read-only, `--network=none`,

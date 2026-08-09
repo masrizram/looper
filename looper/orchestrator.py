@@ -50,6 +50,7 @@ class LooperDaemon:
             config.openrouter,
             config.retry,
             model_prices_usd_per_1k=config.execution.model_prices_usd_per_1k,
+            completion_prices_usd_per_1k=config.execution.completion_prices_usd_per_1k,
             default_token_price_usd=config.execution.default_token_price_usd,
             max_cost_usd=config.execution.max_cost_usd,
         )
@@ -84,9 +85,9 @@ class LooperDaemon:
     # -- Introspection ---------------------------------------------------
 
     def status_snapshot(self) -> dict[str, Any]:
-        snapshot = self.state.snapshot()
-        # History can be long; /status returns a bounded tail.
-        snapshot["history"] = snapshot.get("history", [])[-20:]
+        # History can be long; /status returns a bounded tail. Trimming inside
+        # snapshot() avoids deep-copying 500 entries to then show 20.
+        snapshot = self.state.snapshot(history_limit=20)
         snapshot["build_in_progress"] = self._build_lock.locked()
         # Cost observability: an unattended daemon must report what it spends.
         snapshot["token_usage"] = self.client.total_usage.as_dict()
