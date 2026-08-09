@@ -1,0 +1,39 @@
+# Scenario 04 -- Looper as a CI release gate
+#
+# Non-interactive. The pipeline reads only the exit code:
+#   0 = cleared the gate      3 = built but scored too low
+#   2 = config error          4 = cost ceiling hit
+#   5 = no sandbox            6 = provider out of credits
+
+workspace: "./workspace/ci"
+state_file: "./looper_state_ci.json"
+
+execution:
+  max_cycles: 3
+  target_score: 95
+  min_acceptable: 90
+  max_cost_usd: 5.00
+
+  user_tests_dir: "./user_tests"
+
+  # In CI there is always a container runtime, so demand one explicitly
+  # rather than letting `auto` fall back to something weaker.
+  sandbox_tests: true
+  sandbox_backend: "docker"
+  sandbox_fail_closed: true
+  sandbox_image: "python:3.11-slim"
+  sandbox_network: "none"
+
+  # A reviewable commit per cycle: the diff is the audit trail.
+  git:
+    enabled: true
+    branch_prefix: "looper/"
+    commit_per_cycle: true
+
+  lint_generated: "flake8"
+
+# Notify the team channel when the gate closes.
+notifications:
+  webhook_url: ""          # set from CI secrets, e.g. via envsubst
+  on_status: ["below_minimum", "cost_exhausted", "out_of_credits", "failed"]
+  timeout_seconds: 10

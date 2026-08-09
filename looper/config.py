@@ -53,6 +53,23 @@ KNOWN_PHASES = frozenset(
 LOOPBACK_BINDS = frozenset({"127.0.0.1", "localhost", "::1"})
 ALL_INTERFACES = "0.0.0.0"  # nosec B104 - compared against, never bound by default
 
+#: Terminal build outcomes a webhook may be subscribed to. Kept here rather
+#: than in ``looper.notify`` so config validation does not import the
+#: notifier (and so an invalid ``on_status`` is rejected by --check-config).
+NOTIFIABLE_STATUSES = frozenset(
+    {"passed", "below_minimum", "cost_exhausted", "out_of_credits", "failed"}
+)
+
+#: Default subscription: every terminal outcome. A webhook a user has bothered
+#: to configure should be loud by default; narrowing it is the opt-in.
+DEFAULT_NOTIFY_STATUSES: tuple[str, ...] = (
+    "passed",
+    "below_minimum",
+    "cost_exhausted",
+    "out_of_credits",
+    "failed",
+)
+
 
 class ConfigError(ValueError):
     """Raised when the supplied configuration is invalid."""
@@ -457,6 +474,34 @@ def _validate_phases(names: Any, field_name: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class NotificationsConfig:
+    """Where to POST a one-line summary when a build reaches a terminal state.
+
+    Off by default (empty ``webhook_url``). Deliberately transport-agnostic:
+    the payload carries a ``text`` field that Slack, Discord and Mattermost
+    all render unmodified, plus structured fields for anything else.
+    """
+
+    webhook_url: str = ""
+    timeout_seconds: float = 10.0
+    on_status: tuple[str, ...] = DEFAULT_NOTIFY_STATUSES
+    headers: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.webhook_url and not self.webhook_url.startswith(("http://", "https://")):
+            raise ConfigError(
+                "notifications.webhook_url must be http(s), got " f"{self.webhook_url!r}"
+            )
+        _require_number(self.timeout_seconds, "notifications.timeout_seconds", 0.1, 300.0)
+        unknown = [s for s in self.on_status if s not in NOTIFIABLE_STATUSES]
+        if unknown:
+            raise ConfigError(
+                f"notifications.on_status contains unknown status {unknown}; "
+                f"valid values are {sorted(NOTIFIABLE_STATUSES)}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class LooperConfig:
     """Fully validated runtime configuration."""
 
@@ -470,6 +515,7 @@ class LooperConfig:
     scoring: ScoringWeights = field(default_factory=ScoringWeights)
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     openrouter: OpenRouterConfig = field(default_factory=OpenRouterConfig)
+    notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 
     agents: Mapping[str, AgentSpec] = field(default_factory=lambda: dict(DEFAULT_AGENTS))
 
@@ -605,6 +651,25 @@ def build_config(
         request_timeout_seconds=or_raw.get("request_timeout_seconds", 300.0),
     )
 
+    notify_raw = section("notifications")
+    notify_headers = notify_raw.get("headers") or {}
+    if not isinstance(notify_headers, Mapping):
+        raise ConfigError(f"notifications.headers must be a mapping, got {notify_headers!r}")
+    on_status_raw = notify_raw.get("on_status")
+    notifications = NotificationsConfig(
+        webhook_url=str(notify_raw.get("webhook_url", "")),
+        timeout_seconds=notify_raw.get("timeout_seconds", 10.0),
+        on_status=(
+            # NOT ``NotificationsConfig.on_status``: with slots=True that
+            # attribute is a member descriptor, not the default value, and
+            # feeding it in made every config build raise TypeError.
+            DEFAULT_NOTIFY_STATUSES
+            if on_status_raw is None
+            else tuple(str(s) for s in on_status_raw)
+        ),
+        headers={str(k): str(v) for k, v in notify_headers.items()},
+    )
+
     agents_raw = section("agents")
     agents: dict[str, AgentSpec] = {}
     unknown_agents = set(agents_raw) - set(DEFAULT_AGENTS)
@@ -634,6 +699,7 @@ def build_config(
         scoring=scoring,
         retry=retry,
         openrouter=openrouter,
+        notifications=notifications,
         agents=agents,
         first_cycle_phases=_validate_phases(
             raw.get("phases", list(DEFAULT_FIRST_CYCLE_PHASES)), "phases"

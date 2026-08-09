@@ -1,13 +1,19 @@
 # Looper
 
-**A release gate for AI-written code.** Ten specialised LLM agents run in a
-scored loop — build → test → review → audit → fix — but the point is not that
-an AI writes code. The point is that Looper **refuses to accept it without
-evidence**: fail-closed scoring, a hard USD budget, sandboxed test execution,
-and human-owned tests the AI never sees.
+> Looper is a **fail-closed release gate for AI-written code, built for CI** —
+> not an interactive assistant. It enforces a hard USD ceiling, runs a
+> human-owned test suite the model never sees, and exits with deterministic
+> codes a pipeline can branch on.
+
+Ten specialised LLM agents run in a scored loop — build → test → review →
+audit → fix — but the point is not that an AI writes code. The point is that
+Looper **refuses to accept it without evidence**.
 
 ```bash
-pip install looper
+# NOTE: the name `looper` on PyPI belongs to an unrelated project.
+# Install from source:
+git clone https://github.com/masrizram/looper && cd looper && pip install -e .
+
 looper --doctor                            # what isolation does this host actually have?
 looper --goal "build a URL shortener"      # exit 3 if it does not clear the gate
 ```
@@ -36,9 +42,19 @@ export OPENROUTER_API_KEY=sk-or-...   # bash / Linux / macOS
 
 looper --check-config                 # validate config.yaml
 looper --check-models                 # every model slug really exists
+looper --doctor                       # can this host isolate generated code?
 looper --goal "build a CLI todo app"  # one build, then exit
+looper --resume --goal "..."          # same goal: skip phases already paid for
 looper --daemon                       # 24/7: HTTP + file watcher
 ```
+
+New here? Start with [`examples/01-minimal-trial`](examples/01-minimal-trial/) —
+three phases, one cycle, a hard $0.50 ceiling.
+
+**No Docker on Windows?** `--doctor` exits `5` and builds refuse to run
+generated tests; that is the fail-closed contract, not a bug. Either install
+Docker, or run `wsl --install` — WSL is now a supported sandbox backend
+([ADR-016](docs/adr/016-wsl-as-a-third-sandbox-backend.md)).
 
 `python daemon.py --goal "..."` still works — `daemon.py` is a compatibility
 shim over the `looper` package.
@@ -56,9 +72,10 @@ shim over the `looper` package.
 | [Operations](docs/operations.md) | Triggering builds, HTTP API, retry/timeout behaviour |
 | [Configuration & CLI](docs/configuration.md) | Config file, env vars, every flag, every exit code |
 | [Example prompts](docs/example-prompts.md) | 3 copy-paste prompts that exercise the strongest features |
+| [Examples](examples/) | 5 runnable scenarios: minimal trial, budget guard, human-owned tests, CI gate, daemon + webhook |
 | [Development](docs/development.md) | Quality gates, 100% coverage policy, ADR index |
 
-Design decisions live in [`docs/adr/`](docs/adr/) — ten records covering why
+Design decisions live in [`docs/adr/`](docs/adr/) — sixteen records covering why
 each safeguard exists.
 
 ---

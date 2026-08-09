@@ -27,6 +27,21 @@ REVIEW_FILE = "review.md"
 SECURITY_FILE = "security_audit.md"
 DOCS_FILE = "docs/README.md"
 
+#: Primary output file per phase, used by the resume checkpoint to prove a
+#: phase's work survived. ``test`` is intentionally absent even though it
+#: writes TESTS_FILE: its value is the *execution* result (pass/fail counts),
+#: which lives only in the score and must be re-established each cycle, so a
+#: resumed run always re-runs the suite.
+PHASE_ARTIFACTS: dict[str, str] = {
+    "research": RESEARCH_FILE,
+    "architecture": DESIGN_FILE,
+    "build": CODE_FILE,
+    "review": REVIEW_FILE,
+    "security_audit": SECURITY_FILE,
+    "performance_optimize": OPTIMIZED_FILE,
+    "documentation": DOCS_FILE,
+}
+
 #: Agents habitually wrap code in ```python fences, and often prefix the
 #: block with prose ("Here is the code:"). Parsing the fenced text as Python
 #: would always raise, so a fenced block's body is extracted; if there is no
@@ -147,3 +162,21 @@ class WorkspaceMixin:
         if path.exists():
             return path.read_text(encoding="utf-8")
         return ""
+
+    def phase_artifact_exists(self, phase: str) -> bool:
+        """True when ``phase``'s primary output file is present and non-empty.
+
+        The resume checkpoint records which phases *ran*; this answers whether
+        their work still exists. A phase with no file of its own (nothing in
+        :data:`PHASE_ARTIFACTS`) is never resumable, because there would be no
+        evidence to justify skipping it -- fail closed, exactly as scoring
+        does with unverified evidence.
+        """
+        relative = PHASE_ARTIFACTS.get(phase)
+        if relative is None:
+            return False
+        try:
+            path = self.resolve_in_workspace(relative)
+        except WorkspaceEscapeError:  # pragma: no cover - constants are safe
+            return False
+        return path.exists() and path.stat().st_size > 0

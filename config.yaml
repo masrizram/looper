@@ -81,12 +81,16 @@ execution:
   sandbox_cpu_shares: 1.0
   sandbox_wall_seconds: 300
   sandbox_rss_bytes: 1000000000
-  # Isolation backend: auto | rlimit | docker | none. ADR-008.
-  #   auto   -> prefer Docker if present, otherwise POSIX rlimits.
-  #   docker -> single-use container: read-only, no network, cpu/memory/pids
-  #             capped. The ONLY option with identical guarantees on Windows.
-  #   rlimit -> preexec_fn + RLIMIT_CPU/RLIMIT_AS (POSIX only).
-  #   none   -> NO isolation. LLM-generated code runs directly on the host.
+  # Isolation backend: auto | rlimit | docker | podman | wsl | none.
+    #   auto   -> docker > podman > rlimit > wsl. ADR-008.
+    #   docker -> single-use container: read-only, no network, cpu/memory/pids
+    #             capped. The ONLY option with identical guarantees on Windows.
+    #   podman -> same contract, rootless daemon.
+    #   rlimit -> preexec_fn + RLIMIT_CPU/RLIMIT_AS (POSIX only).
+    #   wsl    -> runs in a WSL2 distro under ulimit caps. Weaker than a
+    #             container (shares the host network, sees /mnt), but it lets a
+    #             Windows host without Docker Desktop build at all. ADR-016.
+    #   none   -> NO isolation. LLM-generated code runs directly on the host.
   sandbox_backend: "auto"
   sandbox_image: "python:3.11-slim"
   sandbox_network: "none"
@@ -205,3 +209,15 @@ agents:
 # final_phases:
 #   - performance_optimize
 #   - documentation
+
+# --- Outbound notifications (optional) ---------------------------------------
+# Disabled while webhook_url is empty. When set, Looper POSTs a JSON summary
+# ONCE per build, on terminal outcomes only. A delivery failure is logged and
+# ignored -- telemetry must never turn a passing build red. See
+# docs/configuration.md#notifications.
+# notifications:
+#   webhook_url: "https://hooks.slack.com/services/..."
+#   on_status: ["passed", "below_minimum", "cost_exhausted", "out_of_credits", "failed"]
+#   timeout_seconds: 10
+#   headers: {}
+

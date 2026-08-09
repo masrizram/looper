@@ -22,6 +22,7 @@ from looper.sandbox import (
     podman_available,
     posix_rlimits_available,
     resolve_backend,
+    wsl_available,
 )
 from looper.vcs import GitRepo
 
@@ -74,6 +75,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--goal", type=str, help="Run one build for this goal and exit")
     parser.add_argument("--daemon", action="store_true", help="Run continuously (24/7)")
     parser.add_argument("--reset", action="store_true", help="Reset persisted state and exit")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Skip research/architecture when the saved state shows they already "
+            "completed for this exact --goal and their artifacts survive"
+        ),
+    )
     parser.add_argument("--check-config", action="store_true", help="Validate config and exit")
     parser.add_argument(
         "--check-models",
@@ -173,6 +182,7 @@ def run_doctor(config: LooperConfig) -> int:
     docker = docker_available()
     podman = podman_available()
     rlimits = posix_rlimits_available()
+    wsl = wsl_available()
     git_ok = GitRepo(Path(config.workspace)).available()
 
     logger.info("looper %s doctor", __version__)
@@ -180,6 +190,7 @@ def run_doctor(config: LooperConfig) -> int:
     logger.info("  docker daemon       : %s", "yes" if docker else "no")
     logger.info("  podman machine      : %s", "yes" if podman else "no")
     logger.info("  POSIX rlimits       : %s", "yes" if rlimits else "no")
+    logger.info("  WSL distro          : %s", "yes" if wsl else "no")
     logger.info("  git binary          : %s", "yes" if git_ok else "no")
     logger.info("  sandbox_backend     : %s", execution.sandbox_backend)
     logger.info("  sandbox_fail_closed : %s", execution.sandbox_fail_closed)
@@ -195,12 +206,19 @@ def run_doctor(config: LooperConfig) -> int:
         )
     except SandboxUnavailableError as exc:
         logger.error("SANDBOX UNAVAILABLE: %s", exc)
-        logger.error("Builds will refuse to run generated tests. Install Docker or set")
-        logger.error("execution.sandbox_fail_closed: false to accept the risk explicitly.")
+        logger.error("Builds will refuse to run generated tests. Fix with ONE of:")
+        logger.error("  * install Docker Desktop (strongest: no network, read-only rootfs)")
+        logger.error("  * run `wsl --install` for a WSL2 distro (resource limits, shared network)")
+        logger.error("  * set execution.sandbox_fail_closed: false to accept the risk explicitly")
         return EXIT_SANDBOX_UNAVAILABLE
     logger.info("  effective sandbox   : %s", effective)
     if effective == "none":
         logger.warning("No isolation in effect; generated tests run on the host")
+    if effective == "wsl":
+        logger.warning(
+            "WSL sandbox bounds CPU/memory but shares the host network and can "
+            "reach the Windows filesystem via /mnt; Docker is stronger"
+        )
     if execution.git_enabled and not git_ok:
         logger.warning("git_enabled is true but no git binary was found; commits will be skipped")
     return EXIT_OK
@@ -233,7 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.doctor:
         return run_doctor(config)
 
-    daemon = LooperDaemon(config, config_dir=config_dir)
+    daemon = LooperDaemon(config, config_dir=config_dir, resume=args.resume)
 
     if args.reset:
         daemon.state.reset()

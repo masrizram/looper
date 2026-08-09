@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from looper.sandbox import (
+    EFFECTIVE_BACKENDS,
     SANDBOX_BACKENDS,
     SandboxUnavailableError,
     docker_argv,
@@ -176,7 +177,7 @@ def test_every_declared_backend_is_handled():
             result = resolve_backend(backend, fail_closed=False, runner=_runner(0))
         except SandboxUnavailableError:  # pragma: no cover - fail_closed is off
             pytest.fail(f"{backend} raised despite fail_closed=False")
-        assert result in ("docker", "podman", "rlimit", "none")
+        assert result in EFFECTIVE_BACKENDS
 
 
 # -- container argv ------------------------------------------------------

@@ -25,7 +25,27 @@ DEFAULT_STATE: dict[str, Any] = {
     "files_created": [],
     "errors": [],
     "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    #: Phase names already completed successfully for ``current_goal``, in
+    #: order. This is the resume checkpoint: every entry here is a phase whose
+    #: artifact is on disk and whose LLM calls have already been paid for, so
+    #: ``--resume`` can skip it instead of buying the same answer twice.
+    "completed_phases": [],
 }
+
+
+def build_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
+    """The subset of state that makes a run resumable.
+
+    Split out so the contract is explicit and testable: a resume decision may
+    only depend on the goal it was recorded for, the phases proven complete,
+    and the cycle reached.
+    """
+    return {
+        "goal": state.get("current_goal"),
+        "completed_phases": list(state.get("completed_phases") or []),
+        "cycle": int(state.get("cycle", 0) or 0),
+        "status": state.get("status"),
+    }
 
 
 class StateManager:
@@ -56,6 +76,7 @@ class StateManager:
                     merged["history"] = list(merged.get("history") or [])
                     merged["files_created"] = list(merged.get("files_created") or [])
                     merged["errors"] = list(merged.get("errors") or [])
+                    merged["completed_phases"] = list(merged.get("completed_phases") or [])
                     return merged
                 logger.error(
                     "State file %s holds %s, expected an object; starting fresh",
@@ -108,6 +129,25 @@ class StateManager:
             if path not in files:
                 files.append(path)
         self.state["files_created"] = files
+        self._snapshot_cache = None
+
+    def record_completed_phase(self, phase: str) -> None:
+        """Mark ``phase`` as proven complete for the current goal.
+
+        Idempotent: re-running a phase after a resume must not duplicate the
+        entry, or the checkpoint would grow without bound on a daemon that
+        retries. Not capped like ``history`` because the set is bounded by
+        the number of known phases.
+        """
+        done = list(self.state.get("completed_phases") or [])
+        if phase not in done:
+            done.append(phase)
+        self.state["completed_phases"] = done
+        self._snapshot_cache = None
+
+    def clear_completed_phases(self) -> None:
+        """Drop the checkpoint (a new goal invalidates every prior artifact)."""
+        self.state["completed_phases"] = []
         self._snapshot_cache = None
 
     def record_error(self, message: str) -> None:

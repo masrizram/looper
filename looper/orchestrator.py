@@ -11,14 +11,26 @@ from typing import Any
 
 from looper.config import CostBudgetExceeded, LooperConfig
 from looper.llm import OpenRouterClient, OutOfCreditsError
+from looper.notify import Notifier
 from looper.phases import CycleEvidence, PhaseManager, PhaseResult
 from looper.scoring import ScoreBreakdown, ScoringEngine
 from looper.server import HTTPServer
-from looper.state import StateManager
+from looper.state import StateManager, build_checkpoint
 from looper.vcs import BuildRepo, GitRepo
 from looper.watcher import FileWatcher
 
 logger = logging.getLogger("looper.orchestrator")
+
+
+#: Phases a resume may skip. Deliberately excludes every phase that produces
+#: *scored evidence* (build, test, review, security_audit): ADR-004 says a
+#: cycle may only score facts it re-verified, so skipping review would bank a
+#: previous run's 92 without re-earning it -- exactly the hole
+#: ``CycleEvidence.invalidate_unverified`` exists to close. What is skippable
+#: is the expensive *input* work: research and architecture are read by later
+#: phases but contribute no points themselves, and together they are the two
+#: most costly agents in cycle 1.
+RESUMABLE_PHASES: frozenset[str] = frozenset({"research", "architecture"})
 
 
 def _utcnow() -> str:
@@ -42,9 +54,12 @@ class LooperDaemon:
         watcher: FileWatcher | None = None,
         vcs: BuildRepo | None = None,
         config_dir: Path | None = None,
+        notifier: Notifier | None = None,
+        resume: bool = False,
     ) -> None:
         self.config = config
         self._config_dir = Path(config_dir) if config_dir else None
+        self._resume = resume
         self.state = state or StateManager(config.state_file, config.execution.max_history_entries)
         self.client = client or OpenRouterClient(
             config.openrouter,
@@ -58,6 +73,7 @@ class LooperDaemon:
             config, self.state, self.client, config_dir=self._config_dir
         )
         self.scoring = ScoringEngine(config.scoring)
+        self.notifier = notifier or Notifier(config.notifications)
         self.watcher = watcher or FileWatcher(
             config.watch_file, self._on_command, config.watch_interval
         )
@@ -66,6 +82,9 @@ class LooperDaemon:
         )
         self._build_lock = asyncio.Lock()
         self._running = False
+        #: Phases the current build inherited from a resume checkpoint and
+        #: must not pay for again. Reset at the start of every build.
+        self._skip_phases: set[str] = set()
         self.vcs = vcs or self._default_vcs()
 
     def _default_vcs(self) -> BuildRepo | None:
@@ -140,22 +159,98 @@ class LooperDaemon:
         async with self._build_lock:
             return await self._build_locked(goal)
 
+    def resumable_phases(self, goal: str) -> tuple[str, ...]:
+        """Phases already paid for and provable on disk for ``goal``.
+
+        Empty when resume is off, when the checkpoint belongs to a *different*
+        goal, or when the previous run actually finished. Resuming across
+        goals would hand cycle 1 an architecture written for something else,
+        which is worse than paying for it again -- so the goal must match
+        exactly.
+        """
+        if not self._resume:
+            return ()
+        checkpoint = build_checkpoint(self.state.state)
+        if checkpoint["goal"] != goal:
+            if checkpoint["goal"]:
+                logger.info(
+                    "Not resuming: checkpoint is for a different goal (%r)", checkpoint["goal"]
+                )
+            return ()
+        if checkpoint["status"] == "done":
+            logger.info("Not resuming: the previous run for this goal completed")
+            return ()
+        done = tuple(checkpoint["completed_phases"])
+        # Scored phases are never resumable (ADR-004): only unscored input
+        # work may be skipped, or a resumed cycle would bank evidence it
+        # never re-verified.
+        eligible = tuple(p for p in done if p in RESUMABLE_PHASES)
+        # A phase is only resumable if its artifact still exists. A wiped
+        # workspace with a stale state file would otherwise skip straight to
+        # `build` with no design document to read.
+        surviving = tuple(p for p in eligible if self.phases.phase_artifact_exists(p))
+        missing = [p for p in eligible if p not in surviving]
+        if missing:
+            logger.warning(
+                "Checkpoint lists %s but their artifacts are gone; re-running them", missing
+            )
+        return surviving
+
     async def _build_locked(self, goal: str) -> float:
         try:
-            return await self._build_phases(goal)
-        except CostBudgetExceeded:
+            score = await self._build_phases(goal)
+        except CostBudgetExceeded as exc:
             # The ceiling is now enforced inside the LLM client, so it can fire
             # mid-cycle rather than only at the loop guard. Persist the reason
             # before it propagates, or /status would still read "running" for a
             # build that has already stopped.
             self.state.update(status="cost_exhausted")
             self.state.save()
+            self._notify_outcome(goal, "cost_exhausted", detail=str(exc))
             raise
+        except OutOfCreditsError as exc:
+            # Status is already persisted by _run_phases; this only adds the
+            # outbound notification, which must not be skipped just because
+            # the abort came from a phase rather than the budget guard.
+            self._notify_outcome(goal, "out_of_credits", detail=str(exc))
+            raise
+        self._notify_outcome(
+            goal,
+            "passed" if score >= self.config.execution.min_acceptable else "below_minimum",
+            score=score,
+        )
+        return score
+
+    def _notify_outcome(
+        self, goal: str, status: str, *, score: float | None = None, detail: str = ""
+    ) -> None:
+        """Best-effort webhook post. Never raises, never affects the score."""
+        self.notifier.notify(
+            status=status,
+            goal=goal,
+            score=float(self.state.state.get("score", 0.0)) if score is None else score,
+            cycle=int(self.state.state.get("cycle", 0) or 0),
+            cost_usd=self.client.running_cost_usd(),
+            detail=detail,
+        )
 
     async def _build_phases(self, goal: str) -> float:
         execution = self.config.execution
+        # Compute the checkpoint BEFORE reset() wipes it. This ordering is the
+        # whole feature: reset() is what makes each build independent, so the
+        # resume decision has to be taken against the state as it was found.
+        resumable = self.resumable_phases(goal)
         self.state.reset()
         self.state.update(current_goal=goal, status="running")
+        if resumable:
+            logger.info(
+                "Resuming: skipping %d already-completed phase(s): %s",
+                len(resumable),
+                ", ".join(resumable),
+            )
+            for phase in resumable:
+                self.state.record_completed_phase(phase)
+        self._skip_phases = set(resumable)
         self.state.save()
 
         final: ScoreBreakdown | None = None
@@ -273,6 +368,14 @@ class LooperDaemon:
         evidence: CycleEvidence,
     ) -> CycleEvidence:
         for phase_name in phase_names:
+            if phase_name in self._skip_phases:
+                logger.info("Phase: %s (skipped, resumed from checkpoint)", phase_name)
+                # Consume the skip: it is valid once, for the cycle that
+                # inherited it. Leaving it set would skip research in every
+                # later cycle too, which the retry phase list may legitimately
+                # want to re-run.
+                self._skip_phases.discard(phase_name)
+                continue
             handler = getattr(self.phases, f"run_{phase_name}", None)
             if handler is None:
                 logger.warning("Unknown phase %r; skipping", phase_name)
@@ -281,6 +384,12 @@ class LooperDaemon:
             result = await handler(goal)
             self._log(result)
             evidence.absorb(result)
+            if result.ok:
+                # Checkpoint only successful phases: a failed phase left a
+                # partial or error-text artifact on disk, and resuming onto
+                # that would silently feed garbage to the next phase.
+                self.state.record_completed_phase(phase_name)
+                self.state.save()
 
             # Hard stop: a 402 (account out of credits) cannot be retried into
             # success. Continuing would only burn the remaining phases and

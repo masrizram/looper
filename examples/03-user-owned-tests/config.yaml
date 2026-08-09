@@ -1,0 +1,44 @@
+# Scenario 03 -- the anti-overfit gate (the one that matters)
+#
+#   looper --config examples/03-user-owned-tests/config.yaml \
+#          --goal "build a shopping cart module with add, remove and total"
+#
+# user_tests_dir points at a suite YOU wrote. It is never shown to any agent,
+# never regenerated, and the generated code must pass it in addition to the
+# AI's own tests. Without this, the AI writes both the code and the exam.
+
+workspace: "./workspace/cart"
+state_file: "./looper_state_cart.json"
+
+execution:
+  max_cycles: 4
+  target_score: 95
+  min_acceptable: 85
+  max_cost_usd: 8.00
+
+  # Relative to THIS config file, not the shell's CWD.
+  user_tests_dir: "./user_tests"
+
+  # Reject a generated suite that exists only to pass. Below this assertion
+  # density the tests are treated as absent, capping the score at 60.
+  min_test_assertions_per_100_lines: 6
+
+  sandbox_tests: true
+  sandbox_backend: "auto"
+  sandbox_fail_closed: true
+  sandbox_cpu_seconds: 60
+  sandbox_wall_seconds: 300
+
+  # NOTE: under a container backend only the workspace is mounted, so a
+  # user_tests_dir outside it is skipped rather than silently "passing".
+  # Keeping it beside the config and inside the workspace avoids that.
+
+agents:
+  builder:
+    model: "anthropic/claude-sonnet-5"
+  # Different family from the builder, on purpose (ADR-006): if the code
+  # author and the test author share a model, their blind spots line up.
+  tester:
+    model: "anthropic/claude-opus-5"
+  reviewer:
+    model: "openai/gpt-5.6-terra"

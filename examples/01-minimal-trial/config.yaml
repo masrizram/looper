@@ -1,0 +1,38 @@
+# Scenario 01 -- minimal trial
+# The cheapest run that still exercises the loop end to end.
+#
+#   looper --config examples/01-minimal-trial/config.yaml --check-models
+#   looper --config examples/01-minimal-trial/config.yaml --goal "build a CLI unit converter"
+#
+# One cycle, three phases, one model family, and a hard $0.50 ceiling so a
+# first experiment cannot surprise you on the invoice.
+
+workspace: "./workspace/trial"
+state_file: "./looper_state_trial.json"
+
+execution:
+  max_cycles: 1
+  # Deliberately low: a 3-phase run has no security audit, so it can never
+  # reach the default 95. Lowering the bar keeps exit code 0 meaningful for
+  # this scenario instead of always returning 3.
+  target_score: 60
+  min_acceptable: 50
+  max_cost_usd: 0.50
+  sandbox_tests: true
+  sandbox_backend: "auto"
+  sandbox_fail_closed: true
+
+# Only the phases needed to produce and verify code. Research, review,
+# security audit and docs are where most of the money goes.
+phases: ["architecture", "build", "test"]
+retry_phases: ["build", "test"]
+final_phases: []
+
+agents:
+  architect:
+    model: "anthropic/claude-sonnet-5"
+  builder:
+    model: "anthropic/claude-sonnet-5"
+  # Still a different family from the builder: ADR-006 holds even in a trial.
+  tester:
+    model: "openai/gpt-5.6-sol"

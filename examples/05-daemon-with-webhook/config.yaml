@@ -1,0 +1,51 @@
+# Scenario 05 -- 24/7 daemon with outbound notifications
+#
+#   export OPENROUTER_API_KEY="<your OpenRouter key>"
+#   export LOOPER_HTTP_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(32))")
+#   looper --config examples/05-daemon-with-webhook/config.yaml --daemon
+#
+# Then trigger a build:
+#   curl -X POST http://127.0.0.1:9999/build \
+#        -H "Authorization: Bearer $LOOPER_HTTP_TOKEN" \
+#        -H "Content-Type: application/json" \
+#        -d '{"goal": "build a rate limiter"}'
+#
+# WARNING: POST /build executes LLM-written code. Treat it as remote code
+# execution by design. The bind stays on loopback.
+
+workspace: "./workspace/daemon"
+state_file: "./looper_state_daemon.json"
+watch_file: "./looper_commands.txt"
+watch_interval: 2.0
+
+http:
+  bind: "127.0.0.1"
+  port: 9999
+  auth_token_env: "LOOPER_HTTP_TOKEN"
+  rate_limit_per_minute: 6
+  max_goal_length: 4000
+
+execution:
+  max_cycles: 4
+  target_score: 95
+  min_acceptable: 90
+  max_cost_usd: 10.00
+  sandbox_tests: true
+  sandbox_backend: "auto"
+  sandbox_fail_closed: true
+
+# --- Outbound notifications --------------------------------------------------
+# Fired ONCE per build, on terminal outcomes only. A failing webhook is logged
+# and ignored: telemetry must never turn a passing build red.
+#
+# The payload carries a `text` field that Slack, Discord and Mattermost all
+# render unmodified, plus structured fields (status, goal, score, cycle,
+# cost_usd, detail) for anything else.
+#
+# Secrets: put the token in a header, and remember this file is committed --
+# prefer an env-substituted copy in production.
+notifications:
+  webhook_url: "https://hooks.slack.com/services/REPLACE/ME"
+  on_status: ["passed", "below_minimum", "cost_exhausted", "out_of_credits", "failed"]
+  timeout_seconds: 10
+  headers: {}

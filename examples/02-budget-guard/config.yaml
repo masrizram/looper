@@ -1,0 +1,34 @@
+# Scenario 02 -- the budget is a real ceiling
+#
+#   looper --config examples/02-budget-guard/config.yaml --goal "build a JSON schema validator"
+#   echo $?    # expect 4
+#
+# max_cost_usd is set absurdly low ON PURPOSE. The point is to watch the run
+# abort with exit code 4 rather than to get an artifact.
+#
+# Why this is worth a scenario: the ceiling is enforced by RESERVING the
+# projected worst-case cost BEFORE each request is sent (ADR-013). An earlier
+# version checked the running total before the call and added the cost after
+# it, so a $1.00 budget could still buy a $15.00 Opus call -- the ceiling was
+# only ever noticed once already breached.
+
+workspace: "./workspace/budget"
+state_file: "./looper_state_budget.json"
+
+execution:
+  max_cycles: 3
+  max_cost_usd: 0.05     # far below one frontier call: the abort is the demo
+  target_score: 99
+  min_acceptable: 95
+  sandbox_tests: true
+  sandbox_fail_closed: true
+
+  # Prices are what the reservation is computed from. Set them to YOUR real
+  # rates: an under-stated price makes the ceiling under-reserve.
+  default_token_price_usd: 0.002
+
+agents:
+  researcher:
+    model: "anthropic/claude-opus-5"
+  architect:
+    model: "anthropic/claude-opus-5"

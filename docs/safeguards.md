@@ -35,7 +35,14 @@ scan *refuses to run* any suite that shells out, spawns processes, touches the
 network, or uses `eval`/`exec`. **If no isolation backend is available, the
 suite is refused rather than run unconfined** — this previously degraded
 silently to no sandbox on Windows (ADR-006,
-[ADR-008](adr/008-cross-platform-sandbox-fail-closed.md)). Check your host:
+[ADR-008](adr/008-cross-platform-sandbox-fail-closed.md)).
+
+On a Windows host with no container runtime, `wsl` is the third backend: it
+bounds CPU, address space and process count via `ulimit` inside a WSL2 distro
+([ADR-016](adr/016-wsl-as-a-third-sandbox-backend.md)). It is deliberately last
+in `auto` precedence — it shares the host network and can reach the Windows
+filesystem through `/mnt`, so a container is strictly stronger and `--doctor`
+says so when WSL is what you get. Check your host:
 
 ```bash
 looper --doctor        # exit 5 means this host cannot isolate anything
@@ -80,7 +87,7 @@ All safeguards live under the `execution` key in `config.yaml`.
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `sandbox_tests` | `true` | Run generated suites under isolation. |
-| `sandbox_backend` | `auto` | `auto` \| `rlimit` \| `docker` \| `none`. `auto` prefers Docker (ADR-008). |
+| `sandbox_backend` | `auto` | `auto` \| `rlimit` \| `docker` \| `podman` \| `wsl` \| `none`. `auto` order: docker > podman > rlimit > wsl ([ADR-008](adr/008-cross-platform-sandbox-fail-closed.md), [ADR-016](adr/016-wsl-as-a-third-sandbox-backend.md)). |
 | `sandbox_fail_closed` | `true` | Refuse to run generated tests when no isolation exists. |
 | `sandbox_image` | `python:3.11-slim` | Image used by the Docker backend. |
 | `sandbox_network` | `none` | Container network mode. |

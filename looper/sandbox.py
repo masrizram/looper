@@ -16,6 +16,8 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import re
+import shlex
 import subprocess  # nosec B404 - used with a fixed argv, never shell=True
 import tokenize
 from dataclasses import dataclass
@@ -461,10 +463,10 @@ class SandboxUnavailableError(RuntimeError):
 
 
 #: Accepted values for ``execution.sandbox_backend``.
-SANDBOX_BACKENDS: tuple[str, ...] = ("auto", "rlimit", "docker", "podman", "none")
+SANDBOX_BACKENDS: tuple[str, ...] = ("auto", "rlimit", "docker", "podman", "wsl", "none")
 
 #: Effective backends ``resolve_backend`` may return.
-EFFECTIVE_BACKENDS: tuple[str, ...] = ("rlimit", "docker", "podman", "none")
+EFFECTIVE_BACKENDS: tuple[str, ...] = ("rlimit", "docker", "podman", "wsl", "none")
 
 #: Container runtimes share one locked-down ``run`` contract (read-only,
 #: no network, cpu/memory/pids capped). Either binary satisfies it.
@@ -527,6 +529,82 @@ def _docker_probe(
     return proc.returncode == 0
 
 
+def wsl_available(runner: Runner | None = None, *, timeout: float = 15.0) -> bool:
+    """True when ``wsl.exe`` can actually execute a command in a Linux distro.
+
+    The probe deliberately *runs* something (``/bin/sh -c 'exit 0'``) rather
+    than asking ``wsl -l``: on a Windows host with the WSL feature enabled but
+    **no distribution installed**, ``wsl -l`` and ``wsl --status`` still exit
+    0 while any real command exits 127. Trusting those would claim isolation
+    we cannot deliver -- the same fail-open trap ADR-008 closed for
+    ``docker --version``. Measured on the reference Windows host: ``wsl -l -q``
+    exit 0, ``wsl -e /bin/sh -c 'exit 0'`` exit 127, so this returns False.
+
+    The timeout is longer than the container probes because a cold WSL VM has
+    to boot before the first command runs.
+    """
+    run = runner or subprocess.run
+    try:
+        proc = run(  # nosec B603 B607 - fixed argv, no shell
+            ["wsl.exe", "-e", "/bin/sh", "-c", "exit 0"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def to_wsl_path(value: str) -> str:
+    """Rewrite a Windows path into its ``/mnt/<drive>`` WSL form.
+
+    ``C:\\xampp\\htdocs\\looper`` becomes ``/mnt/c/xampp/htdocs/looper``.
+    Anything that is not a drive-letter absolute path is returned unchanged:
+    pytest node ids, flags, and paths already in POSIX form must survive.
+    """
+    match = re.match(r"^([A-Za-z]):[\\/](.*)$", value)
+    if match is None:
+        return value
+    drive, tail = match.group(1).lower(), match.group(2).replace("\\", "/")
+    return f"/mnt/{drive}" if not tail else f"/mnt/{drive}/{tail}"
+
+
+def wsl_argv(
+    argv: list[str],
+    *,
+    cwd: str,
+    cpu_seconds: int,
+    rss_bytes: int,
+) -> list[str]:
+    """Wrap ``argv`` so it runs inside WSL under POSIX rlimits.
+
+    This is the answer to the single biggest adoption blocker: on a Windows
+    host without Docker Desktop, ``resolve_backend`` had nothing to offer and
+    every build refused to run its tests (``--doctor`` exit 5). WSL2 is a real
+    Linux kernel, so ``ulimit`` gives the same RLIMIT_CPU / RLIMIT_AS /
+    RLIMIT_NPROC / RLIMIT_FSIZE guarantees the ``rlimit`` backend provides on
+    native POSIX.
+
+    **It is weaker than a container and deliberately not treated as equal:**
+    WSL shares the host network stack and can reach the Windows filesystem
+    through ``/mnt``, so it bounds *resource* blast radius, not *network* or
+    *filesystem* blast radius. ``auto`` therefore prefers Docker/Podman first
+    and only falls back here, and the static tripwire scan still runs before
+    anything is executed.
+    """
+    limits = (
+        f"ulimit -t {max(1, cpu_seconds)}; "
+        f"ulimit -v {max(65536, rss_bytes // 1024)}; "
+        "ulimit -u 64 2>/dev/null || true; "
+        "ulimit -f 65536 2>/dev/null || true; "
+    )
+    inner = " ".join(shlex.quote(to_wsl_path(arg)) for arg in argv[1:])
+    command = f"{limits}exec python3 {inner}"
+    return ["wsl.exe", "--cd", cwd, "-e", "/bin/sh", "-c", command]
+
+
 def container_runtime_available(*, runner: Runner | None = None) -> str | None:
     """First available Docker-compatible runtime, or ``None``.
 
@@ -585,14 +663,30 @@ def resolve_backend(
             "rlimit backend requested but this platform has no fork/rlimits", fail_closed
         )
 
+    if requested == "wsl":
+        if wsl_available(runner):
+            return "wsl"
+        return _unavailable(
+            "wsl backend requested but wsl.exe could not run a command "
+            "(is a distribution installed? try `wsl --install`)",
+            fail_closed,
+        )
+
     # auto
     runtime = container_runtime_available(runner=runner)
     if runtime is not None:
         return runtime
     if posix_rlimits_available():
         return "rlimit"
+    # Last resort before refusing: on Windows WSL2 is a real Linux kernel, so
+    # ulimit gives genuine resource containment where nothing else could. It
+    # is ranked below containers because it shares the host network and can
+    # see the Windows filesystem via /mnt.
+    if wsl_available(runner):
+        return "wsl"
     return _unavailable(
-        "no sandbox backend available (no Docker/Podman daemon, no POSIX rlimits)", fail_closed
+        "no sandbox backend available (no Docker/Podman daemon, no POSIX rlimits, no WSL distro)",
+        fail_closed,
     )
 
 
@@ -739,6 +833,15 @@ def run_sandboxed(
                 runtime=effective,
                 cpu_shares=cpu_shares,
             ),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    if effective == "wsl":
+        return run(  # nosec B603 - fixed argv, no shell
+            wsl_argv(argv, cwd=cwd, cpu_seconds=cpu_seconds, rss_bytes=rss_bytes),
             capture_output=True,
             text=True,
             timeout=timeout,

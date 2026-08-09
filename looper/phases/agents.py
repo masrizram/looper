@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -147,7 +148,15 @@ class AgentPhasesMixin:
 
         self.state.update(current_phase="architecture", status="in_progress")
         design = await self.client.call(architect, self.prompts.architecture(goal, research))
-        api_notes = await self.client.call(designer, self.prompts.api_design(goal, design.text))
+        # Fail fast between the two agents of this phase. A 402 on the
+        # architect guarantees a 402 on the designer -- issuing the second
+        # call anyway bought nothing and doubled the noise in state.errors
+        # (the observed failure mode: ten identical "402 out of credits"
+        # entries for one build). The reply is synthesised, not sent.
+        if design.out_of_credits:
+            api_notes = replace(design, text="")
+        else:
+            api_notes = await self.client.call(designer, self.prompts.api_design(goal, design.text))
 
         combined = f"{design.text}\n\n## API & DX Design (UX/API Designer)\n\n{api_notes.text}"
         written = self.write_file(DESIGN_FILE, combined)
