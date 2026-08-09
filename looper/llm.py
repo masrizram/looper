@@ -214,6 +214,16 @@ class OpenRouterClient:
         #: making ``max_cost_usd`` (ADR-005) a budget in name only.
         self._cost_usd = 0.0
         self._cost_by_model: dict[str, float] = {}
+        #: Cost promised to in-flight calls that have not yet been billed.
+        #: Without this, two coroutines running concurrently each see the same
+        #: ``_cost_usd``, each decide there is room, and both spend -- so
+        #: parallelising phases would quietly turn the hard ceiling back into
+        #: the soft cap ADR-013 removed. A reservation is taken before the
+        #: request and released once the real cost is known.
+        self._reserved_usd = 0.0
+        #: Guards the reserve/release pair. ``asyncio.Lock`` is created lazily
+        #: because a client may be constructed outside a running loop.
+        self._budget_lock: asyncio.Lock | None = None
 
         if client is not None:
             self._client = client
@@ -261,9 +271,47 @@ class OpenRouterClient:
         whatever it cost, so a $1.00 budget on an Opus roster reached $15.00
         in a single request. The ceiling has to be checked against the money
         the call is *about* to spend, not the money already spent.
-        """
-        self._check_budget(self.projected_cost_usd(agent, prompt, extra_system))
 
+        The projected cost is *reserved* for the duration of the call and
+        released when the real figure is known. Reserving is what keeps the
+        ceiling hard once phases run concurrently: two coroutines checking an
+        unreserved balance would both see room and both spend.
+        """
+        projected = self.projected_cost_usd(agent, prompt, extra_system)
+        await self._reserve(projected)
+        try:
+            return await self._call_reserved(agent, prompt, extra_system=extra_system)
+        finally:
+            await self._release(projected)
+
+    async def _budget_guard(self) -> asyncio.Lock:
+        """The reservation lock, created on the running loop at first use."""
+        if self._budget_lock is None:
+            self._budget_lock = asyncio.Lock()
+        return self._budget_lock
+
+    async def _reserve(self, projected_usd: float) -> None:
+        """Book ``projected_usd`` against the ceiling, or refuse the call."""
+        async with await self._budget_guard():
+            self._check_budget(projected_usd)
+            self._reserved_usd += projected_usd
+
+    async def _release(self, projected_usd: float) -> None:
+        """Give back a reservation once the call's real cost is booked."""
+        async with await self._budget_guard():
+            # Clamped at zero: floating-point drift across many reserve/release
+            # pairs must never make the reservation negative, which would hand
+            # a later call headroom the budget does not have.
+            self._reserved_usd = max(0.0, self._reserved_usd - projected_usd)
+
+    async def _call_reserved(
+        self,
+        agent: AgentSpec,
+        prompt: str,
+        *,
+        extra_system: str = "",
+    ) -> AgentReply:
+        """Issue the request. The budget reservation is already held."""
         system_prompt = (
             f"You are the {agent.role} on an autonomous multi-agent software "
             "engineering team. Stay strictly within this role's responsibilities."
@@ -392,8 +440,12 @@ class OpenRouterClient:
         Raised rather than returned as a failed ``AgentReply``: an exhausted
         budget is a run-level stop condition, not a per-agent failure the
         pipeline should score and move past.
+
+        ``_reserved_usd`` is included so concurrent calls cannot each spend
+        the same headroom.
         """
-        if self._max_cost_usd > 0 and self._cost_usd + projected_usd >= self._max_cost_usd:
+        committed = self._cost_usd + self._reserved_usd
+        if self._max_cost_usd > 0 and committed + projected_usd >= self._max_cost_usd:
             raise CostBudgetExceeded(round(self._cost_usd, 6), self._max_cost_usd)
 
     def projected_cost_usd(self, agent: AgentSpec, prompt: str, extra_system: str = "") -> float:

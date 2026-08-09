@@ -55,14 +55,26 @@ class PromptGenerator:
         )
 
     @staticmethod
-    def build(goal: str, architecture: str, *, package_mode: bool = False) -> str:
+    def build(
+        goal: str,
+        architecture: str,
+        *,
+        package_mode: bool = False,
+        fence_tag: str = "python",
+        extension: str = ".py",
+    ) -> str:
         # In package mode the parser only recognises one marker syntax, so the
         # prompt has to name it exactly; anything else falls back to the
         # single-file path and the multi-file feature silently never fires.
+        #
+        # The fence tag and extension come from the language adapter rather
+        # than being hard-coded: telling a Go builder to emit ```python is how
+        # a multi-language pipeline produces artifacts that fail their own
+        # syntax gate.
         output_rule = (
             "Output EVERY file using this exact marker syntax, one per file:\n"
-            "### FILE: relative/path/to/file.py\n"
-            "```python\n"
+            f"### FILE: relative/path/to/file{extension}\n"
+            f"```{fence_tag}\n"
             "<complete file contents>\n"
             "```\n"
             "Use only relative paths (no leading '/', no '..'). Allowed "

@@ -33,10 +33,24 @@ looper --goal "build a URL shortener"      # exit 3 if it does not clear the gat
 
 ## Quick start
 
+Try the whole gate first — **no API key, no network, no spend**:
+
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
+looper --init                                        # minimal starter config
+looper --dry-run --goal "build a CLI todo app" \
+       --report run_report.json                      # every gate runs for real
+```
+
+A local stub answers each agent, so nothing is billed, but lint, adequacy,
+sandbox and scoring all run for real — the verdict is honest. On a host with
+no sandbox the run above ends at **exit 3** with `tests: 0.0`, because Looper
+refuses to execute LLM-written tests unconfined. That refusal *is* the product.
+
+Then wire up a real model:
+
+```bash
 export OPENROUTER_API_KEY=sk-or-...   # bash / Linux / macOS
 # Windows (PowerShell):  $env:OPENROUTER_API_KEY="sk-or-..."
 
@@ -47,6 +61,15 @@ looper --goal "build a CLI todo app"  # one build, then exit
 looper --resume --goal "..."          # same goal: skip phases already paid for
 looper --daemon                       # 24/7: HTTP + file watcher
 ```
+
+Or skip the host-setup question entirely — the image ships with a sandbox:
+
+```bash
+docker build -t looper . && docker run --rm -e OPENROUTER_API_KEY looper --doctor
+```
+
+The image's entrypoint is `looper` itself, so flags go straight after the
+image name.
 
 New here? Start with [`examples/01-minimal-trial`](examples/01-minimal-trial/) —
 three phases, one cycle, a hard $0.50 ceiling.
@@ -75,7 +98,7 @@ shim over the `looper` package.
 | [Examples](examples/) | 5 runnable scenarios: minimal trial, budget guard, human-owned tests, CI gate, daemon + webhook |
 | [Development](docs/development.md) | Quality gates, 100% coverage policy, ADR index |
 
-Design decisions live in [`docs/adr/`](docs/adr/) — sixteen records covering why
+Design decisions live in [`docs/adr/`](docs/adr/) — eighteen records covering why
 each safeguard exists.
 
 ---

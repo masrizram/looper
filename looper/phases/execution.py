@@ -7,15 +7,14 @@ module is where code the AI wrote actually runs (ADR-006, ADR-008).
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import logging
 import subprocess  # nosec B404 - used with a fixed argv, never shell=True
-import sys
 from pathlib import Path
 
 from looper.adequacy import evaluate_suite
 from looper.config import LooperConfig
+from looper.languages import LanguageAdapter, adapter_for
 from looper.llm import AgentReply
 from looper.phases.workspace import strip_code_fences
 from looper.sandbox import SandboxUnavailableError, run_sandboxed, scan_for_dangerous_calls
@@ -36,57 +35,50 @@ class ExecutionMixin:
     def resolve_in_workspace(self, relative_path: str) -> Path:  # pragma: no cover - mixin contract
         raise NotImplementedError
 
+    def _adapter(self) -> LanguageAdapter:
+        """The language adapter this build targets."""
+        return adapter_for(self.config.execution.language)
+
     def _lint_generated(self, relative_path: str) -> tuple[bool, str]:
         """Compile/lint generated code before it is accepted.
 
-        ``py_compile`` catches latent syntax/indent errors ``ast.parse`` can
-        miss; ``flake8`` adds style checks. Returns (ok, note).
+        The argv comes from the language adapter, so ``py_compile``/``flake8``
+        are Python's answer to the question rather than the pipeline's only
+        vocabulary. Returns (ok, note).
         """
         mode = self.config.execution.lint_generated
-        if mode == "off":
-            return True, ""
+        adapter = self._adapter()
         path = self.resolve_in_workspace(relative_path)
-        if mode == "py_compile":
-            try:
-                subprocess.run(  # nosec B603 - fixed argv, no shell
-                    [sys.executable, "-m", "py_compile", str(path)],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-            except subprocess.CalledProcessError as exc:
-                return False, f"generated code failed py_compile: {exc.stderr[:200]}"
+        argv = adapter.lint_argv(str(path), mode)
+        if not argv:
             return True, ""
-        # Only the flake8 path remains: off/py_compile already returned above,
-        # and build_config guarantees the mode is one of off|py_compile|flake8.
         proc = subprocess.run(  # nosec B603 - fixed argv, no shell
-            [sys.executable, "-m", "flake8", "--max-line-length=100", str(path)],
+            argv,
             capture_output=True,
             text=True,
             check=False,
         )
         if proc.returncode != 0:
-            return False, f"generated code failed flake8: {proc.stdout[:200]}"
+            # py_compile reports on stderr, flake8 on stdout; show whichever
+            # actually carries the diagnostic rather than guessing per mode.
+            detail = (proc.stdout or proc.stderr)[:200]
+            return False, f"generated code failed {mode}: {detail}"
         return True, ""
 
     def _verify_syntax(self, reply: AgentReply) -> tuple[bool, str]:
         """``build_ok`` must mean *the code parses*, not *the LLM answered*.
 
         Previously any non-empty reply -- prose, an apology, a truncated file --
-        scored the full build weight. Now the generated module is parsed; a
-        syntax error fails the build closed.
+        scored the full build weight. Now the generated module is parsed by the
+        language adapter; a syntax error fails the build closed.
         """
         if reply.failed:
             return False, ""
         source = strip_code_fences(reply.text)
-        if not source.strip():
-            return False, "build produced empty output"
-        try:
-            ast.parse(source)
-        except SyntaxError as exc:
-            logger.error("Generated code does not parse: %s", exc)
-            return False, f"generated code has a syntax error: {exc}"
-        return True, ""
+        ok, note = self._adapter().parse_ok(source)
+        if not ok and note:
+            logger.error("Generated code rejected: %s", note)
+        return ok, note
 
     async def _execute_generated_tests(self) -> tuple[int, int, str]:
         """Run the generated suite, refusing/sandboxing untrusted code.
@@ -192,19 +184,7 @@ class ExecutionMixin:
         keep the isolation that actually mattered.
         """
         exec_cfg = self.config.execution
-        argv = [
-            sys.executable,
-            "-E",
-            "-s",
-            "-B",
-            "-m",
-            "pytest",
-            str(tests_dir),
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "--no-header",
-        ]
+        argv = self._adapter().test_argv(str(tests_dir))
         timeout = exec_cfg.test_timeout_seconds
         try:
             if exec_cfg.sandbox_tests:

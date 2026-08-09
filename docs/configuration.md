@@ -45,7 +45,10 @@ slug the provider retired, and a host that cannot sandbox.
 | Flag | Effect |
 |---|---|
 | `--version` | Print version and exit |
+| `--init [PATH]` | Write a minimal starter config (default `config.yaml`) and exit. Never overwrites an existing file |
 | `--goal "..."` | Run one build, exit non-zero if below `min_acceptable` |
+| `--dry-run` | Answer every agent from a local stub: no API key, no network, no spend. Lint, adequacy, sandbox and scoring still run for real, so the verdict is honest |
+| `--report [PATH]` | Write a machine-readable run report (default `run_report.json`): verdict, score breakdown, spend per model, per-phase history. Appends a Markdown summary to `$GITHUB_STEP_SUMMARY` when that variable is set |
 | `--daemon` | Run HTTP server + file watcher until signalled |
 | `--check-config` | Validate config and exit |
 | `--check-models` | Verify every configured model slug against the live OpenRouter catalogue, and exit |

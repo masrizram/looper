@@ -6,16 +6,19 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from looper import __version__
 from looper.config import ConfigError, CostBudgetExceeded, LooperConfig, load_config_with_dir
+from looper.dryrun import StubClient
 from looper.llm import OutOfCreditsError
 from looper.models import CatalogueUnavailableError, check_models, fetch_catalogue
 from looper.orchestrator import LooperDaemon
+from looper.report import REPORT_FILENAME, build_report, write_run_report, write_step_summary
 from looper.sandbox import (
     SandboxUnavailableError,
     docker_available,
@@ -24,6 +27,7 @@ from looper.sandbox import (
     resolve_backend,
     wsl_available,
 )
+from looper.scaffold import DEFAULT_CONFIG_NAME, ScaffoldExistsError, write_starter_config
 from looper.vcs import GitRepo
 
 logger = logging.getLogger("looper.cli")
@@ -72,7 +76,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"looper {__version__}")
     parser.add_argument("--config", type=str, default=None, help="Path to config YAML")
+    parser.add_argument(
+        "--init",
+        nargs="?",
+        const=DEFAULT_CONFIG_NAME,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a minimal starter config (8 keys, everything else defaulted) "
+            f"to PATH (default: {DEFAULT_CONFIG_NAME}) and exit. Never overwrites."
+        ),
+    )
     parser.add_argument("--goal", type=str, help="Run one build for this goal and exit")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run the whole pipeline with a local stub in place of the LLM: no API "
+            "key, no network, no spend. Every gate (lint, adequacy, sandbox, "
+            "scoring) still runs for real, so the verdict is honest."
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        nargs="?",
+        const=REPORT_FILENAME,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a machine-readable run report (score breakdown, spend per "
+            f"model, per-phase history) to PATH (default: {REPORT_FILENAME}). "
+            "When $GITHUB_STEP_SUMMARY is set, a Markdown summary is appended "
+            "to it as well."
+        ),
+    )
     parser.add_argument("--daemon", action="store_true", help="Run continuously (24/7)")
     parser.add_argument("--reset", action="store_true", help="Reset persisted state and exit")
     parser.add_argument(
@@ -224,10 +261,71 @@ def run_doctor(config: LooperConfig) -> int:
     return EXIT_OK
 
 
+def run_init(path: str) -> int:
+    """Write a starter config, refusing to clobber an existing one."""
+    try:
+        written = write_starter_config(Path(path))
+    except ScaffoldExistsError as exc:
+        logger.error("%s", exc)
+        return EXIT_CONFIG_ERROR
+    except OSError as exc:
+        logger.error("Could not write %s: %s", path, exc)
+        return EXIT_CONFIG_ERROR
+    logger.info("Wrote starter config to %s", written)
+    logger.info("Next steps:")
+    logger.info('  1. looper --config %s --dry-run --goal "build a CLI todo app"', written)
+    logger.info("     (no API key needed: the whole gate runs against a local stub)")
+    logger.info("  2. export OPENROUTER_API_KEY=... then looper --check-models")
+    logger.info("  3. looper --doctor    # what isolation can this host give?")
+    return EXIT_OK
+
+
+def emit_report(
+    *,
+    destination: str,
+    daemon: LooperDaemon,
+    config: LooperConfig,
+    goal: str,
+    score: float,
+    exit_code: int,
+    dry_run: bool,
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Write the run report, and the CI step summary when running in CI."""
+    state = daemon.state.state
+    report = build_report(
+        goal=goal,
+        status=str(state.get("status", "")),
+        score=score,
+        min_acceptable=config.execution.min_acceptable,
+        target_score=config.execution.target_score,
+        cycles=int(state.get("cycle", 0) or 0),
+        exit_code=exit_code,
+        score_breakdown=state.get("score_breakdown") or {},
+        cost_usd=daemon.client.running_cost_usd(),
+        cost_by_model=daemon.client.cost_by_model(),
+        token_usage=daemon.client.total_usage.as_dict(),
+        llm_calls=daemon.client.call_count,
+        phases=state.get("history") or [],
+        artifacts=state.get("files_created") or [],
+        dry_run=dry_run,
+    )
+    write_run_report(report, Path(destination))
+    source = os.environ if env is None else env
+    summary_path = source.get("GITHUB_STEP_SUMMARY", "")
+    if summary_path:
+        write_step_summary(report, Path(summary_path))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(args.log_level, args.json_logs)
+
+    # Scaffolding runs BEFORE the config is loaded: the entire point of
+    # --init is that there is no config to load yet.
+    if args.init is not None:
+        return run_init(args.init)
 
     try:
         config, config_dir = load_config_with_dir(args.config)
@@ -251,32 +349,69 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.doctor:
         return run_doctor(config)
 
-    daemon = LooperDaemon(config, config_dir=config_dir, resume=args.resume)
+    client = StubClient(config) if args.dry_run else None
+    if args.dry_run:
+        logger.info(
+            "DRY RUN: every agent is answered by a local stub. No API key is used, "
+            "no request leaves this machine, and spend stays at $0.00. Every gate "
+            "still runs for real, so the verdict below is honest."
+        )
+    daemon = LooperDaemon(config, config_dir=config_dir, resume=args.resume, client=client)
 
     if args.reset:
         daemon.state.reset()
         logger.info("State reset.")
         return EXIT_OK
 
+    exit_code = EXIT_OK
+    score = 0.0
     try:
         if args.goal:
             score = asyncio.run(daemon.build(args.goal))
             logger.info("Final score: %.2f", score)
-            return EXIT_OK if score >= config.execution.min_acceptable else EXIT_BUILD_BELOW_MINIMUM
-        if args.daemon:
+            exit_code = (
+                EXIT_OK if score >= config.execution.min_acceptable else EXIT_BUILD_BELOW_MINIMUM
+            )
+        elif args.daemon:
             return asyncio.run(_run_daemon(daemon))
+        else:
+            parser.print_help()
+            return EXIT_OK
     except CostBudgetExceeded as exc:
         logger.error("Build aborted: %s", exc)
-        return EXIT_COST_EXCEEDED
+        exit_code = EXIT_COST_EXCEEDED
     except OutOfCreditsError as exc:
         logger.error("Build aborted: %s", exc)
-        return EXIT_OUT_OF_CREDITS
+        exit_code = EXIT_OUT_OF_CREDITS
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         logger.info("Interrupted.")
         return EXIT_INTERRUPTED
 
-    parser.print_help()
-    return EXIT_OK
+    # The report describes the build regardless of how it ended: a run that
+    # hit the cost ceiling is exactly the run whose spend breakdown someone
+    # wants to read.
+    if args.report is not None:
+        _write_report(args, daemon, config, score, exit_code)
+    return exit_code
+
+
+def _write_report(
+    args: argparse.Namespace,
+    daemon: LooperDaemon,
+    config: LooperConfig,
+    score: float,
+    exit_code: int,
+) -> None:
+    """Thin wrapper so the report call is one traceable statement."""
+    emit_report(
+        destination=args.report,
+        daemon=daemon,
+        config=config,
+        goal=args.goal or "",
+        score=score,
+        exit_code=exit_code,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

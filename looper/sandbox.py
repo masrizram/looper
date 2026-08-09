@@ -73,6 +73,12 @@ DANGEROUS_CALL_PATHS: frozenset[str] = frozenset(
         "exec",
         "compile",
         "__import__",
+        # Dynamic import is the same capability as ``__import__`` wearing a
+        # friendlier name: ``importlib.import_module("os").system(...)`` walked
+        # straight past a scanner that refused ``__import__("os")``. Found by
+        # the labelled corpus (ADR-017), not by coverage.
+        "importlib.import_module",
+        "importlib.__import__",
         "breakpoint",
         "os.system",
         "os.popen",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,42 @@ logger = logging.getLogger("looper.orchestrator")
 #: phases but contribute no points themselves, and together they are the two
 #: most costly agents in cycle 1.
 RESUMABLE_PHASES: frozenset[str] = frozenset({"research", "architecture"})
+
+#: Phases that may run concurrently with each other. ``review`` and
+#: ``security_audit`` both read the finished artifact and write to separate
+#: files; neither reads the other's output, and each contributes an
+#: independent term to the score. Running them serially cost a full agent
+#: round-trip of wall clock for no ordering benefit.
+#:
+#: Deliberately a *small allowlist* rather than a dependency solver. Every
+#: other phase is genuinely sequential -- build reads architecture, test reads
+#: build, fix reads the review findings -- and a wrong guess here would score
+#: a review of code the builder had not finished writing. Adding a phase to
+#: this set is a claim that it reads nothing its co-runner writes (ADR-018).
+PARALLEL_PHASE_GROUP: frozenset[str] = frozenset({"review", "security_audit"})
+
+
+def _parallel_batches(phase_names: Sequence[str]) -> list[tuple[str, ...]]:
+    """Group ``phase_names`` into execution batches, preserving order.
+
+    Consecutive members of :data:`PARALLEL_PHASE_GROUP` collapse into one
+    batch; everything else is a batch of one. Only *adjacent* phases are
+    grouped, so reordering the configured phase list can never silently move
+    a phase past a dependency it needs.
+    """
+    batches: list[tuple[str, ...]] = []
+    current: list[str] = []
+    for name in phase_names:
+        if name in PARALLEL_PHASE_GROUP:
+            current.append(name)
+            continue
+        if current:
+            batches.append(tuple(current))
+            current = []
+        batches.append((name,))
+    if current:
+        batches.append(tuple(current))
+    return batches
 
 
 def _utcnow() -> str:
@@ -367,50 +404,75 @@ class LooperDaemon:
         phase_names: tuple[str, ...],
         evidence: CycleEvidence,
     ) -> CycleEvidence:
-        for phase_name in phase_names:
-            if phase_name in self._skip_phases:
-                logger.info("Phase: %s (skipped, resumed from checkpoint)", phase_name)
-                # Consume the skip: it is valid once, for the cycle that
-                # inherited it. Leaving it set would skip research in every
-                # later cycle too, which the retry phase list may legitimately
-                # want to re-run.
-                self._skip_phases.discard(phase_name)
-                continue
-            handler = getattr(self.phases, f"run_{phase_name}", None)
-            if handler is None:
-                logger.warning("Unknown phase %r; skipping", phase_name)
-                continue
-            logger.info("Phase: %s", phase_name)
-            result = await handler(goal)
-            self._log(result)
-            evidence.absorb(result)
-            if result.ok:
-                # Checkpoint only successful phases: a failed phase left a
-                # partial or error-text artifact on disk, and resuming onto
-                # that would silently feed garbage to the next phase.
-                self.state.record_completed_phase(phase_name)
-                self.state.save()
+        """Run ``phase_names`` in order, concurrently where it is safe.
 
-            # Hard stop: a 402 (account out of credits) cannot be retried into
-            # success. Continuing would only burn the remaining phases and
-            # cycles on a condition that will not change, so abort with a clear
-            # message instead of grinding to a score of 0.
-            if result.out_of_credits:
-                logger.error(
-                    "=== BUILD ABORTED: OUT OF CREDITS ===\n"
-                    "OpenRouter returned 402 Payment Required for the '%s' phase.\n"
-                    "The account has no credits, so every further agent call would\n"
-                    "fail identically. Add credits at https://openrouter.ai/settings/credits\n"
-                    "then re-run the build.",
-                    result.phase,
+        Results are absorbed in the batch's declared order, never in
+        completion order: scoring must not depend on which agent answered
+        first, or a build's score would vary run to run for the same replies.
+        """
+        for batch in _parallel_batches(phase_names):
+            runnable = [name for name in batch if self._admit_phase(name)]
+            if not runnable:
+                continue
+            if len(runnable) == 1:
+                logger.info("Phase: %s", runnable[0])
+                results = [await self._invoke_phase(runnable[0], goal)]
+            else:
+                logger.info("Phases (parallel): %s", ", ".join(runnable))
+                results = list(
+                    await asyncio.gather(*(self._invoke_phase(name, goal) for name in runnable))
                 )
-                self.state.update(status="out_of_credits")
-                self.state.save()
-                raise OutOfCreditsError(
-                    "OpenRouter 402 Payment Required: account out of credits. "
-                    "Add credits at https://openrouter.ai/settings/credits"
-                )
+            for name, result in zip(runnable, results):
+                if result is None:
+                    continue
+                self._log(result)
+                evidence.absorb(result)
+                if result.ok:
+                    # Checkpoint only successful phases: a failed phase left a
+                    # partial or error-text artifact on disk, and resuming onto
+                    # that would silently feed garbage to the next phase.
+                    self.state.record_completed_phase(name)
+                    self.state.save()
+                if result.out_of_credits:
+                    self._abort_out_of_credits(result)
         return evidence
+
+    def _admit_phase(self, phase_name: str) -> bool:
+        """False when ``phase_name`` is skipped by a resume checkpoint."""
+        if phase_name not in self._skip_phases:
+            return True
+        logger.info("Phase: %s (skipped, resumed from checkpoint)", phase_name)
+        # Consume the skip: it is valid once, for the cycle that inherited
+        # it. Leaving it set would skip research in every later cycle too,
+        # which the retry phase list may legitimately want to re-run.
+        self._skip_phases.discard(phase_name)
+        return False
+
+    async def _invoke_phase(self, phase_name: str, goal: str) -> PhaseResult | None:
+        """Dispatch one phase. ``None`` when no handler exists for it."""
+        handler = getattr(self.phases, f"run_{phase_name}", None)
+        if handler is None:
+            logger.warning("Unknown phase %r; skipping", phase_name)
+            return None
+        result: PhaseResult = await handler(goal)
+        return result
+
+    def _abort_out_of_credits(self, result: PhaseResult) -> None:
+        """Stop the build on a 402: no later call can succeed either."""
+        logger.error(
+            "=== BUILD ABORTED: OUT OF CREDITS ===\n"
+            "OpenRouter returned 402 Payment Required for the '%s' phase.\n"
+            "The account has no credits, so every further agent call would\n"
+            "fail identically. Add credits at https://openrouter.ai/settings/credits\n"
+            "then re-run the build.",
+            result.phase,
+        )
+        self.state.update(status="out_of_credits")
+        self.state.save()
+        raise OutOfCreditsError(
+            "OpenRouter 402 Payment Required: account out of credits. "
+            "Add credits at https://openrouter.ai/settings/credits"
+        )
 
     def _log(self, result: PhaseResult) -> None:
         entry = {

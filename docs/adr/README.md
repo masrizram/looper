@@ -21,6 +21,8 @@ reader (or a future us) does not undo a decision without knowing its reasons.
 | [014](014-measure-gates-in-both-directions.md) | Gates must be measured in both directions | Accepted |
 | [015](015-resume-only-unscored-phases.md) | Resume may skip only unscored phases | Accepted |
 | [016](016-wsl-as-a-third-sandbox-backend.md) | WSL as a third sandbox backend | Accepted |
+| [017](017-labelled-corpus-for-heuristic-gates.md) | A labelled corpus, not coverage, calibrates the heuristic gates | Accepted |
+| [018](018-parallelise-independent-phases.md) | Parallelise only phases that read nothing their co-runner writes | Accepted |
 
 ## Format
 

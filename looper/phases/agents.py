@@ -17,6 +17,7 @@ from typing import Any
 
 from looper.artifact import parse_multifile, primary_module, verify_python_files
 from looper.config import LooperConfig
+from looper.languages import adapter_for
 from looper.llm import AgentReply, OpenRouterClient
 from looper.phases.results import PhaseResult, WorkspaceEscapeError, replace_result
 from looper.phases.workspace import (
@@ -190,10 +191,17 @@ class AgentPhasesMixin:
     async def run_build(self, goal: str) -> PhaseResult:
         architecture = self.read_file(DESIGN_FILE)
         package_mode = self.config.execution.artifact_mode == "package"
+        adapter = adapter_for(self.config.execution.language)
         reply, result = await self._run_agent_phase(
             phase="build",
             agent_key="builder",
-            prompt=self.prompts.build(goal, architecture, package_mode=package_mode),
+            prompt=self.prompts.build(
+                goal,
+                architecture,
+                package_mode=package_mode,
+                fence_tag=adapter.fence_tag,
+                extension=adapter.extension,
+            ),
             output_file=CODE_FILE,
         )
         if package_mode:

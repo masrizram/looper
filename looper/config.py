@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from looper.languages import DEFAULT_LANGUAGE, lint_modes_for, supported_languages
 from looper.sandbox import SANDBOX_BACKENDS
 
 logger = logging.getLogger("looper.config")
@@ -371,6 +372,12 @@ class ExecutionConfig:
     #: accepted, so obviously-broken or style-corrupt output never reaches the
     #: "done" state. Set to "off" to skip.
     lint_generated: str = "py_compile"
+    #: Target language for the generated artifact. Selects a
+    #: :class:`~looper.languages.LanguageAdapter`, which owns the syntax
+    #: check, the lint argv, the test-runner argv and the fence tag the
+    #: builder is told to emit. Defaults to python, which is exactly the
+    #: behaviour every existing config already had.
+    language: str = DEFAULT_LANGUAGE
 
     def __post_init__(self) -> None:
         _require_int(self.max_cycles, "execution.max_cycles", 1, 1000)
@@ -406,10 +413,20 @@ class ExecutionConfig:
                 "execution.min_acceptable must be <= target_score, got "
                 f"min={self.min_acceptable}, target={self.target_score}"
             )
-        if self.lint_generated not in ("off", "py_compile", "flake8"):
+        if self.language not in supported_languages():
             raise ConfigError(
-                "execution.lint_generated must be off|py_compile|flake8, got "
-                f"{self.lint_generated!r}"
+                "execution.language must be one of "
+                f"{list(supported_languages())}, got {self.language!r}"
+            )
+        # Lint modes are a property of the language, not a global constant:
+        # `flake8` is meaningless for a Go artifact. Validating against the
+        # adapter is what keeps a future language from inheriting Python's
+        # vocabulary by accident.
+        valid_modes = lint_modes_for(self.language)
+        if self.lint_generated not in valid_modes:
+            raise ConfigError(
+                f"execution.lint_generated must be one of {list(valid_modes)} "
+                f"for language {self.language!r}, got {self.lint_generated!r}"
             )
         if self.sandbox_backend not in SANDBOX_BACKENDS:
             raise ConfigError(
@@ -612,6 +629,7 @@ def build_config(
         git_author_name=str(git_raw.get("author_name", "looper")),
         git_author_email=str(git_raw.get("author_email", "looper@localhost")),
         lint_generated=exec_raw.get("lint_generated", "py_compile"),
+        language=str(exec_raw.get("language", DEFAULT_LANGUAGE)),
     )
 
     scoring_raw = section("scoring")

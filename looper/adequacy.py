@@ -12,7 +12,10 @@ See ADR-006 (verified evidence).
 from __future__ import annotations
 
 import ast
+import io
 import re
+import token
+import tokenize
 from dataclasses import dataclass
 
 #: Matches an assertion of a hardcoded *looper verdict*, e.g.
@@ -164,8 +167,35 @@ def _imports_subject(
 
 
 def _mentions_module(source: str, module: str) -> bool:
-    """True when ``module`` appears as a whole word in ``source``."""
-    return re.search(rf"\b{re.escape(module)}\b", source) is not None
+    """True when ``module`` is *referenced*, as code or as an artifact path.
+
+    A plain word-boundary search over the raw source counted a bare *string
+    literal* or a *comment* as evidence, so a tautological suite passed the
+    "is this connected to anything?" check by writing
+    ``label = "generated_code"`` or ``# tests generated_code``. Both were
+    accepted by the corpus probe (ADR-017).
+
+    Two forms count, and only these two:
+
+    * a NAME token -- the suite references the identifier in real code
+      (``import generated_code``, ``generated_code.Cart()``);
+    * a STRING token containing ``<module>.py`` -- the v5 case of a suite
+      that reads or execs the artifact from disk rather than importing it.
+      The ``.py`` suffix is what separates a path from a label: no
+      tautological suite writes ``"generated_code.py"`` by accident.
+    """
+    filename = f"{module}.py"
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        # Untokenisable source is not evidence of a subject under test.
+        return False
+    for tok in tokens:
+        if tok.type == token.NAME and tok.string == module:
+            return True
+        if tok.type == token.STRING and filename in tok.string:
+            return True
+    return False
 
 
 def _imported_roots(tree: ast.AST) -> set[str]:
