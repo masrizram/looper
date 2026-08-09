@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
-from looper.state import DEFAULT_STATE, StateManager
+from looper.state import DEFAULT_STATE, StateManager, _atomic_replace
 
 
 def test_fresh_state_uses_defaults(tmp_path):
@@ -98,16 +99,24 @@ def test_save_is_atomic_and_leaves_no_temp_files(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8"))["cycle"] == 4
 
 
-def test_save_cleans_up_temp_on_failure(tmp_path, monkeypatch):
+def test_save_cleans_up_temp_on_real_failure(tmp_path, monkeypatch):
+    """Temp file must be cleaned up when save genuinely fails (both replace
+    and fallback copy fail)."""
     path = tmp_path / "state.json"
     sm = StateManager(path)
 
-    def boom(*args, **kwargs):
+    def boom_replace(source, dest):
         raise OSError("disk full")
 
-    monkeypatch.setattr("looper.state.os.replace", boom)
-    with pytest.raises(OSError, match="disk full"):
-        sm.save()
+    def boom_copy(source, dest):
+        raise OSError("disk full during copy")
+
+    monkeypatch.setattr("looper.state.os.replace", boom_replace)
+    monkeypatch.setattr("looper.state.shutil.copy2", boom_copy)
+
+    with pytest.warns(RuntimeWarning, match="fell back to non-atomic copy"):
+        with pytest.raises(OSError, match="disk full"):
+            sm.save()
     leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
 
@@ -172,18 +181,99 @@ def test_unreadable_state_file_recovers(tmp_path, monkeypatch, caplog):
     assert "Corrupt state file" in caplog.text
 
 
-def test_save_failure_without_temp_file_still_reraises(tmp_path, monkeypatch):
-    """Covers the branch where the temp file is already gone during cleanup."""
+def test_save_falls_back_to_copy_when_replace_fails(tmp_path, monkeypatch):
+    """When os.replace fails, save should fall back to copy2 and succeed
+    with a RuntimeWarning, not raise an exception."""
     path = tmp_path / "state.json"
     sm = StateManager(path)
+    sm.update(status="running", cycle=42)
 
     def boom(*args, **kwargs):
         raise OSError("replace failed")
 
-    real_exists = __import__("pathlib").Path.exists
     monkeypatch.setattr("looper.state.os.replace", boom)
-    monkeypatch.setattr("looper.state.Path.exists", lambda self: False)
 
-    with pytest.raises(OSError, match="replace failed"):
+    with pytest.warns(RuntimeWarning, match="fell back to non-atomic copy"):
         sm.save()
-    assert real_exists is not None
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["cycle"] == 42
+
+
+def test_atomic_replace_retries_on_permission_error(tmp_path, monkeypatch):
+    """Windows PermissionError on os.replace should be retried, not fatal."""
+    src = tmp_path / "src.json"
+    dst = tmp_path / "dst.json"
+    src.write_text('{"test": true}', encoding="utf-8")
+
+    call_count = 0
+    real_replace = os.replace
+
+    def flaky_replace(source, dest):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise PermissionError("access denied")
+        return real_replace(source, dest)
+
+    monkeypatch.setattr("looper.state.os.replace", flaky_replace)
+    _atomic_replace(str(src), str(dst))
+    assert call_count == 3
+    assert json.loads(dst.read_text(encoding="utf-8")) == {"test": True}
+
+
+def test_atomic_replace_fallback_on_persistent_permission_error(tmp_path, monkeypatch):
+    """If os.replace keeps failing, fall back to copy2 and warn."""
+    src = tmp_path / "src.json"
+    dst = tmp_path / "dst.json"
+    src.write_text("fallback data", encoding="utf-8")
+
+    def always_fail(source, dest):
+        raise PermissionError("persistent")
+
+    monkeypatch.setattr("looper.state.os.replace", always_fail)
+
+    with pytest.warns(RuntimeWarning, match="fell back to non-atomic copy"):
+        _atomic_replace(str(src), str(dst))
+    assert dst.read_text(encoding="utf-8") == "fallback data"
+
+
+def test_atomic_replace_exf_posix_oserror_falls_back(tmp_path, monkeypatch):
+    """OSError EXDEV (cross-device link) should trigger immediate fallback."""
+    src = tmp_path / "src.json"
+    dst = tmp_path / "dst.json"
+    src.write_text("cross-device", encoding="utf-8")
+
+    def raise_exdev(source, dest):
+        raise OSError("EXDEV")
+
+    monkeypatch.setattr("looper.state.os.replace", raise_exdev)
+
+    with pytest.warns(RuntimeWarning, match="fell back to non-atomic copy"):
+        _atomic_replace(str(src), str(dst))
+    assert dst.read_text(encoding="utf-8") == "cross-device"
+
+
+def test_save_uses_atomic_replace_with_retry(tmp_path, monkeypatch):
+    """StateManager.save should complete even if os.replace raises PermissionError
+    on the first attempt, thanks to the retry in _atomic_replace."""
+    path = tmp_path / "state.json"
+    sm = StateManager(path)
+    sm.update(status="running", cycle=1)
+
+    call_count = 0
+    real_replace = os.replace
+
+    def flaky_replace(source, dest):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise PermissionError("access denied (simulated Windows handle contention)")
+        return real_replace(source, dest)
+
+    monkeypatch.setattr("looper.state.os.replace", flaky_replace)
+
+    # save() should succeed on the second attempt (call_count == 2)
+    sm.save()
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["cycle"] == 1
+    assert call_count == 2

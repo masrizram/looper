@@ -5,11 +5,71 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
+import time
+import warnings
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("looper.state")
+
+#: Number of times to retry ``os.replace`` when Windows raises PermissionError.
+#: Windows does not guarantee atomic rename semantics: a handle may still be
+#: open on the target, or the process may lack SeCreateFilePrivilege. Retrying
+#: with a short backoff usually resolves transient contention from a polling
+#: reader (e.g. the HTTP /status handler holding a file handle).
+_REPLACE_RETRIES = 5
+
+
+def _atomic_replace(src: str, dst: str) -> None:
+    """Replace ``dst`` with ``src``, retrying on Windows PermissionError.
+
+    On POSIX ``os.replace`` is atomic and never blocks. On Windows it can
+    raise PermissionError when the target is momentarily pinned by another
+    handle (antivirus, a polling reader, etc.). Retrying with a short
+    backoff usually resolves it; if all retries fail we fall back to a
+    non-atomic copy+unlink that works everywhere, then warn loudly because
+    a crash mid-copy would truncate the state file.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _REPLACE_RETRIES + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt < _REPLACE_RETRIES:
+                logger.warning(
+                    "os.replace retry %d/%d on %s (PermissionError on Windows): %s",
+                    attempt,
+                    _REPLACE_RETRIES,
+                    dst,
+                    exc,
+                )
+                time.sleep(0.01 * (2**attempt))  # 20ms, 40ms, 80ms, 160ms
+        except OSError as exc:
+            last_exc = exc
+            break
+    # Fallback: non-atomic copy. Slower and crash-unsafe, but works on
+    # filesystems where os.replace cannot. If the copy itself succeeds we do
+    # NOT raise -- the write completed, just not atomically. If it ALSO fails,
+    # that is a genuine error we must surface.
+    warnings.warn(
+        f"State write fell back to non-atomic copy for {dst} after "
+        f"retrying os.replace {attempt} time(s). A crash mid-write could "
+        f"truncate the state file.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    try:
+        shutil.copy2(src, dst)
+        logger.info("State write completed via copy2 fallback for %s", dst)
+    except OSError:
+        # The copy also failed; surface the original replace error as context.
+        if last_exc is not None:
+            raise last_exc
+
 
 DEFAULT_STATE: dict[str, Any] = {
     "current_goal": None,
@@ -93,6 +153,11 @@ class StateManager:
 
         Writes to a temp file in the same directory then ``os.replace``s it,
         so a crash mid-write can never leave a truncated state file.
+
+        On Windows, ``os.replace`` may raise ``PermissionError`` when the
+        target is momentarily pinned by another handle (e.g. a /status poll).
+        :func:`_atomic_replace` retries with exponential backoff and falls
+        back to a non-atomic copy if all retries are exhausted.
         """
         parent = self.state_file.parent
         parent.mkdir(parents=True, exist_ok=True)
@@ -104,7 +169,7 @@ class StateManager:
                 json.dump(self.state, handle, indent=2, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_name, self.state_file)
+            _atomic_replace(tmp_name, str(self.state_file))
         except BaseException:
             with_suppressed_error = Path(tmp_name)
             if with_suppressed_error.exists():
