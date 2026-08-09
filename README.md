@@ -55,6 +55,7 @@ shim over the `looper` package.
 | [Artifacts & git](docs/artifacts.md) | Multi-file output, path allowlist, per-cycle commit trail |
 | [Operations](docs/operations.md) | Triggering builds, HTTP API, retry/timeout behaviour |
 | [Configuration & CLI](docs/configuration.md) | Config file, env vars, every flag, every exit code |
+| [Example prompts](docs/example-prompts.md) | 3 copy-paste prompts that exercise the strongest features |
 | [Development](docs/development.md) | Quality gates, 100% coverage policy, ADR index |
 
 Design decisions live in [`docs/adr/`](docs/adr/) — ten records covering why
