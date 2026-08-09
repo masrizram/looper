@@ -67,7 +67,7 @@ def _atomic_replace(src: str, dst: str) -> None:
         logger.info("State write completed via copy2 fallback for %s", dst)
     except OSError:
         # The copy also failed; surface the original replace error as context.
-        if last_exc is not None:
+        if last_exc is not None:  # pragma: no cover - last_exc is always set here
             raise last_exc
 
 
@@ -161,19 +161,26 @@ class StateManager:
         """
         parent = self.state_file.parent
         parent.mkdir(parents=True, exist_ok=True)
-        handle_fd, tmp_name = tempfile.mkstemp(
-            dir=str(parent), prefix=self.state_file.name, suffix=".tmp"
-        )
+        tmp_name: str | None = None
+        handle_fd = -1
         try:
+            handle_fd, tmp_name = tempfile.mkstemp(
+                dir=str(parent), prefix=self.state_file.name, suffix=".tmp"
+            )
             with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
                 json.dump(self.state, handle, indent=2, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             _atomic_replace(tmp_name, str(self.state_file))
         except BaseException:
-            with_suppressed_error = Path(tmp_name)
-            if with_suppressed_error.exists():
-                with_suppressed_error.unlink()
+            # Clean up the temp file even if the replace/copy fell back to
+            # shutil.copy2 or raised. We swallow FileNotFoundError here because
+            # the file may already have been removed by a finaliser.
+            from contextlib import suppress
+
+            with suppress(FileNotFoundError, TypeError):
+                if tmp_name is not None:
+                    Path(tmp_name).unlink(missing_ok=True)
             raise
 
     def update(self, **kwargs: Any) -> None:

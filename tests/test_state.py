@@ -277,3 +277,89 @@ def test_save_uses_atomic_replace_with_retry(tmp_path, monkeypatch):
     assert path.exists()
     assert json.loads(path.read_text(encoding="utf-8"))["cycle"] == 1
     assert call_count == 2
+
+
+def test_atomic_replace_raises_original_when_copy_also_fails(tmp_path, monkeypatch):
+    """If os.replace exhausts all retries AND shutil.copy2 also fails,
+    the original os.replace exception should be re-raised."""
+    src = tmp_path / "src.json"
+    dst = tmp_path / "dst.json"
+    src.write_text("data", encoding="utf-8")
+
+    def always_fail_replace(source, dest):
+        raise PermissionError("never lands")
+
+    def always_fail_copy(source, dest):
+        raise OSError("disk full during copy")
+
+    monkeypatch.setattr("looper.state.os.replace", always_fail_replace)
+    monkeypatch.setattr("looper.state.shutil.copy2", always_fail_copy)
+
+    with pytest.warns(RuntimeWarning, match="fell back to non-atomic copy"):
+        with pytest.raises(PermissionError, match="never lands"):
+            _atomic_replace(str(src), str(dst))
+
+
+def test_save_cleans_temp_file_on_genuine_double_failure(tmp_path, monkeypatch):
+    """When both os.replace and copy2 fail, temp file must still be cleaned up."""
+    path = tmp_path / "state.json"
+    sm = StateManager(path)
+
+    def boom_replace(source, dest):
+        raise OSError("disk full")
+
+    def boom_copy(source, dest):
+        raise OSError("disk full during copy")
+
+    monkeypatch.setattr("looper.state.os.replace", boom_replace)
+    monkeypatch.setattr("looper.state.shutil.copy2", boom_copy)
+
+    # The save must clean up the temp file even on double failure.
+    with pytest.warns(RuntimeWarning, match="fell back to non-atomic copy"):
+        with pytest.raises(OSError, match="disk full"):
+            sm.save()
+
+    leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+    # Target file should NOT exist -- copy also failed.
+    assert not path.exists()
+
+
+def test_save_cleans_up_temp_file_on_any_exception(tmp_path, monkeypatch):
+    """Covers the BaseException cleanup path in save() -- even when the
+    exception is not an OSError (e.g. a ValueError from serialisation)."""
+    path = tmp_path / "state.json"
+    sm = StateManager(path)
+
+    def explode(src: str, dst: str) -> None:
+        raise ValueError("serialization imploded")
+
+    monkeypatch.setattr("looper.state._atomic_replace", explode)
+
+    with pytest.raises(ValueError, match="serialization imploded"):
+        sm.save()
+
+    # Temp file created by mkstemp must be cleaned up by the except BaseException
+    # block. Path with suffix ".tmp" must not persist.
+    leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_save_no_temp_file_cleanup_when_mkstemp_fails(tmp_path, monkeypatch):
+    """Covers the else branch in the except BaseException block: when
+    tempfile.mkstemp itself fails, there is no temp file to clean up,
+    so exists() returns False."""
+    path = tmp_path / "state.json"
+    sm = StateManager(path)
+
+    def boom_mkstemp(*args, **kwargs):
+        raise OSError("no space for temp file")
+
+    monkeypatch.setattr("looper.state.tempfile.mkstemp", boom_mkstemp)
+
+    with pytest.raises(OSError, match="no space for temp file"):
+        sm.save()
+
+    # No temp file should exist because mkstemp itself failed.
+    leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
